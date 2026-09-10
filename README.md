@@ -90,3 +90,33 @@ Whale-Pet/
   轮询同步后再用 `(+0.12)` / `(-0.04)` 标出与余额实际消耗的偏离值（没统计到任何一轮时不显示）。
 - 实时·令牌模式：在设置中填入 DeepSeek 平台会话令牌（`Bearer eyJ...`）后，直接调平台用量接口精确换算。
 - 定价常量在 `pet/pricing.py`，DeepSeek 调价时可直接修改。
+
+## 致谢
+
+本项目的**创意来源**、**美术音效素材**与**部分算法**来自开源项目
+**[DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)**
+（DSH 小鲸鱼余额挂件，作者 [MeteorNOX](https://github.com/MeteorNOX)，MIT License）。
+本独立桌面版是在其基础上重新实现的 Python / Qt 版本：
+
+- 🖼️ **美术与音效素材**：`assets/` 中的小鲸鱼本体（`DSniang1.png`、`DSniang02.png`）、
+  表情动图（`rua.gif`）、音效（`Ya1.mp3` / `Ya2.mp3` 小黄鸭、`D1.mp3` / `D2.mp3` 音效1）
+  均取自原项目，仅作直接复用，未作重新绘制。
+- 💰 **峰谷定价规则**：`pet/pricing.py` 移植自原项目 `lib/index.js` ——
+  工作日高峰时段（9:00–12:00、14:00–18:00）、2026-08-23 起周末全天谷价、
+  各模型命中/未命中/输出单价表等规则保持一致。
+- 📐 **气泡视觉参数**：气泡几何（viewBox 1026×700）、文字块中心比例、
+  换行宽度与最小缩放等排版常量同样参照 `lib/index.js`，以保持与原版一致的观感。
+- 🧸 **交互设计**：点击循环切换气泡内容（余额 → 随机台词 → 收起）、四边四分之一吸附、
+  左吸附水平镜像、按压 Q 弹、随机台词与 gif 动图等玩法均沿用原项目的设计。
+
+同时也感谢：
+
+- **[DeepSeek](https://www.deepseek.com/)** 提供 API 与平台用量接口，本项目才得以展示余额与消耗；
+- **[Qt / PySide6](https://doc.qt.io/qtforpython/)** 提供跨平台 GUI 框架，实现了透明置顶窗口、
+  拖拽吸附与动画效果；
+- 所有为原项目提交代码、反馈问题的贡献者。
+
+### 许可说明
+
+原项目采用 **MIT License**（Copyright © 2026 MeteorNOX）。本项目包含其代码移植与素材，
+因此同样遵循 MIT 许可条款并保留原始版权声明；再分发时请一并保留上述致谢与许可信息。
