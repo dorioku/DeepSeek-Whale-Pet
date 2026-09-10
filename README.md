@@ -28,8 +28,9 @@ python main.py
 ## 打包为独立 exe
 
 ```powershell
-release.bat           # 仅打包，产物 dist\WhalePet.exe
-release.bat 0.3       # 打包 + 提交 + 打标签 v0.3 + 推送 + 发布 GitHub Release
+python release.py         # 仅打包，产物 dist\WhalePet.exe
+python release.py 0.3     # 打包 + 提交 + 打标签 v0.3 + 推送 + 发布 GitHub Release
+python release.py 0.3 -y  # 同上，跳过发布前二次确认
 ```
 
 产物：`dist\WhalePet.exe`（单文件，含资源，约 53 MB）。首次运行同样弹出配置窗口。
@@ -73,7 +74,7 @@ resp = client.chat.completions.create(model="deepseek-chat", messages=[...])
 ```text
 Whale-Pet/
 ├── main.py                 # 入口（GUI + 中转服务启动 + 首次配置引导）
-├── release.bat             # 一键构建 / 发布（PyInstaller + GitHub Release）
+├── release.py              # 一键构建 / 发布（PyInstaller + GitHub Release）
 ├── WhalePet.spec           # PyInstaller 打包配置（改打包参数改这里）
 ├── requirements.txt        # PySide6 + requests
 ├── pet/
