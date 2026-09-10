@@ -12,12 +12,13 @@ DeepSeek 小鲸鱼桌宠 —— 独立程序入口。
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QDir, QLockFile, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from pet.config import is_first_run, load_config, save_config
@@ -29,6 +30,16 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("DeepSeek 小鲸鱼")
     app.setQuitOnLastWindowClosed(False)
+
+    # ---- 单实例：两个桌宠会争抢中转端口，并互相覆盖账本缓存 ----
+    # （确需多开时设环境变量 WHALE_PET_ALLOW_MULTI=1；账本已有原子写入 + 合并保护）
+    lock = None
+    if not os.environ.get("WHALE_PET_ALLOW_MULTI"):
+        lock = QLockFile(str(Path(QDir.tempPath()) / "whale-pet.lock"))
+        lock.setStaleLockTime(30_000)
+        if not lock.tryLock(0):
+            print("[whale-pet] 已有一个小鲸鱼在运行，本次启动退出（多开：WHALE_PET_ALLOW_MULTI=1）")
+            return
 
     # 部分环境 Qt 枚举不到系统字体：显式加载中文字体，否则文字变豆腐块
     from pet.whale_widget import ensure_fonts

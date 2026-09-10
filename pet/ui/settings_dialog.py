@@ -8,8 +8,8 @@ import json
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QHBoxLayout, QLabel, QLineEdit, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from ..config import load_config, save_config
@@ -114,6 +114,37 @@ class SettingsDialog(QDialog):
         row.addWidget(self.turn_cost_close)
         form.addRow("每轮消耗", row)
 
+        # --- 预警：余额低于 / 今日已用超过阈值时提醒（气泡 + 托盘通知）---
+        self.alert_balance_on = QCheckBox("余额低于")
+        self.alert_balance_on.setChecked(bool(self.cfg.get("alert_balance_on", True)))
+        self.alert_balance = QDoubleSpinBox()
+        self.alert_balance.setRange(0.0, 100000.0)
+        self.alert_balance.setDecimals(2)
+        self.alert_balance.setPrefix("¥ ")
+        self.alert_balance.setSingleStep(1.0)
+        self.alert_balance.setValue(float(self.cfg.get("alert_balance", 10.0)))
+        row = QHBoxLayout()
+        row.addWidget(self.alert_balance_on)
+        row.addWidget(self.alert_balance)
+        row.addWidget(QLabel("时提醒（0=关闭）"))
+        row.addStretch(1)
+        form.addRow("余额预警", row)
+
+        self.alert_daily_on = QCheckBox("今日已用超过")
+        self.alert_daily_on.setChecked(bool(self.cfg.get("alert_daily_on", True)))
+        self.alert_daily = QDoubleSpinBox()
+        self.alert_daily.setRange(0.0, 100000.0)
+        self.alert_daily.setDecimals(2)
+        self.alert_daily.setPrefix("¥ ")
+        self.alert_daily.setSingleStep(1.0)
+        self.alert_daily.setValue(float(self.cfg.get("alert_daily", 10.0)))
+        row = QHBoxLayout()
+        row.addWidget(self.alert_daily_on)
+        row.addWidget(self.alert_daily)
+        row.addWidget(QLabel("时提醒（每超一档再提醒）"))
+        row.addStretch(1)
+        form.addRow("每日预警", row)
+
         self.peak_mode = QComboBox()
         self.peak_mode.addItem("默认", "default")
         self.peak_mode.addItem("梁文峰谷", "liangwen")
@@ -151,6 +182,10 @@ class SettingsDialog(QDialog):
         self.cfg["bubble_on"] = self.bubble_on.isChecked()
         self.cfg["turn_cost_on"] = self.turn_cost_on.isChecked()
         self.cfg["turn_cost_close_ms"] = self.turn_cost_close.value() * 1000
+        self.cfg["alert_balance_on"] = self.alert_balance_on.isChecked()
+        self.cfg["alert_balance"] = float(self.alert_balance.value())
+        self.cfg["alert_daily_on"] = self.alert_daily_on.isChecked()
+        self.cfg["alert_daily"] = float(self.alert_daily.value())
         self.cfg["peak_mode"] = self.peak_mode.currentData()
         save_config(self.cfg)
         super().accept()

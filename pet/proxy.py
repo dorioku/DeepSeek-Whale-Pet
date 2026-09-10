@@ -221,7 +221,7 @@ class ProxyServer:
         self.on_turn = on_turn
         self.timeout = timeout
         self.last_model = ""
-        self.version = "0.1.0"
+        self.version = "0.2.1"          # 与发布标签保持一致（/healthz 返回）
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 

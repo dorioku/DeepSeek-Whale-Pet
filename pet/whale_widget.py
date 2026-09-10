@@ -5,11 +5,15 @@
 - 气泡（SVG 几何）+ 三行文字（余额 / 今日已用 / 状态）
 - 拖拽 + 四分之一吸附 + 左吸附水平镜像（文字反向保持可读）
 - 按压 Q 弹（底边中心 origin）+ 音效（QMediaPlayer，可降级静音）
-- 余额 60s 自动刷新 + 点击手动；余额变化数字滚动动画 + 弹气泡
+- 自适应轮询：基础 60s；既没中转调用、余额也没变化则每次 +100%（翻倍，上限 30 分钟）；
+  有中转调用或余额与上次不一致就重置回 60s（点击可手动刷新）
+- 余额变化时数字滚动动画 + 弹气泡
 - 随机台词（加权 6 组，含 gif 动图），点击切换、5s 自动收起
 - 每轮对话消耗泡泡（来自中转服务的 usage 统计，跨线程 signal）
-- 每日账本：首次观测缓存当日资金初始值，每轮消耗立刻叠加，轮询同步后给 ±偏离值
-- 托盘 + 右键菜单（设置 / 刷新 / 显示隐藏 / 退出）
+- 每日账本：首次观测缓存当日资金初始值，每轮消耗立刻叠加，轮询同步后给 ±偏离值；
+  按模型记录每日消耗并长期保留（账单对话框看最近 7 天 / 30 天）
+- 预警：余额低于阈值 / 今日已用超过阈值时弹气泡 + 托盘通知
+- 托盘 + 右键菜单（设置 / 账单 / 刷新 / 显示隐藏 / 退出）
 """
 from __future__ import annotations
 
@@ -30,7 +34,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon, QWidget
 
 from .balance import Ledger, fetch_balance, fetch_platform_usage, today_peak_now
-from .config import load_config, save_config
+from .config import ledger_path, legacy_ledger_paths, load_config, save_config
 
 try:
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -41,10 +45,24 @@ except Exception:  # pragma: no cover
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 
 MIN_SCALE, MAX_SCALE = 0.6, 2.5
-REFRESH_MS = 60_000
+REFRESH_MS = 60_000            # 基础轮询间隔（有活动时保持这个节奏）
+REFRESH_MAX_MS = 30 * 60_000   # 空闲降速的上限（30 分钟）
+REFRESH_BACKOFF = 2.0          # 每次“无中转调用且余额没变”的轮询，间隔 +100%（翻倍）
 ANIM_MS = 700
 BUBBLE_MS = 5_000
+ALERT_BUBBLE_MS = 8_000       # 预警气泡停留时长（比普通气泡久一点）
 CLICK_SQ = 9
+
+# 气泡出场/退场动画（尾巴先冒 → 主体回弹展开；收起时整体缩回、消散）
+BUBBLE_IN_MS = 300            # 出现时间轴（透明度/分层进度，线性驱动）
+BUBBLE_OUT_MS = 280           # 收起时长（缩回 + 消散）
+POP_IN_MS = 360               # 出现时的缩放回弹（OutBack，轻微过冲）
+TAIL_LEAD = 0.38              # 尾巴在全时间轴的前 38% 冒完（收起时最后 38% 才消失）
+BODY_LAG = 0.34               # 主体从 34% 开始展开（收起时先缩）
+POP_LOAD = 0.80               # 初始 / 收起末尾的气泡尺寸比例
+TEXT_RISE = 14.0              # 文字淡入上浮距离（viewBox 单位）
+COST_ROLL_MS = 320            # 连轮金额滚动时长
+BUBBLE_COOLDOWN_MS = 550      # 气泡完全收起后的冷却：期间不再自动生成新气泡（防连续闪泡）
 
 # 音效节流（防连点叠音）：实测音效时长 104~264ms
 SOUND_MIN_GAP_MS = 90         # 两声之间最短间隔，更密的请求直接丢弃
@@ -161,23 +179,45 @@ class Animator:
                 self.on_finish()
 
 
-def _svg_bubble() -> QPixmap:
-    """用原版 SVG 几何预渲染气泡（白色填充 + 深蓝描边）。"""
+def _clamp01(v: float) -> float:
+    return 0.0 if v <= 0.0 else (1.0 if v >= 1.0 else float(v))
+
+
+def _smoothstep(v: float) -> float:
+    """0→1 的缓入缓出（用于把线性时间轴映射成柔和的透明度曲线）。"""
+    v = _clamp01(v)
+    return v * v * (3.0 - 2.0 * v)
+
+
+def _pop_curve(t: float) -> float:
+    """气泡展开曲线：缓入缓出 + 中后段轻微过冲（「啵」地弹开的手感）。"""
+    t = _clamp01(t)
+    return _smoothstep(t) + 0.5 * math.sin(math.pi * t) * (t ** 1.5)
+
+
+# 气泡几何：主体（大泡 + 嘴）与尾巴（两个小圆）拆开渲染，方便分层出场
+# 出现时小尾巴先冒出来，主体随后「啵」地弹开；收起时主体先缩回、尾巴最后消失。
+_BUBBLE_SVG_HEAD = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1026 700">'
+    '<path fill="#FFFFFF" stroke="#203170" stroke-width="18" '
+    'stroke-linejoin="round" stroke-linecap="round" '
+    'd="M 827 248 A 373 232 0 1 0 81 246 A 373 232 0 0 0 301 465 '
+    'A 57 32 10 0 0 413 484 A 373 232 0 0 0 827 248 Z"/></svg>'
+)
+_BUBBLE_SVG_TAIL = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1026 700">'
+    '<ellipse cx="352" cy="561" rx="37.5" ry="26" fill="#FFFFFF" '
+    'stroke="#203170" stroke-width="18"/>'
+    '<ellipse cx="442" cy="646" rx="24.5" ry="18" fill="#FFFFFF" '
+    'stroke="#203170" stroke-width="18"/></svg>'
+)
+
+
+def _render_svg(svg: str) -> QPixmap:
+    """用原版 SVG 几何预渲染（白色填充 + 深蓝描边）。"""
     try:
         from PySide6.QtSvg import QSvgRenderer
-        svg = (
-            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1026 700">'
-            '<path fill="#FFFFFF" stroke="#203170" stroke-width="18" '
-            'stroke-linejoin="round" stroke-linecap="round" '
-            'd="M 827 248 A 373 232 0 1 0 81 246 A 373 232 0 0 0 301 465 '
-            'A 57 32 10 0 0 413 484 A 373 232 0 0 0 827 248 Z"/>'
-            '<ellipse cx="352" cy="561" rx="37.5" ry="26" fill="#FFFFFF" '
-            'stroke="#203170" stroke-width="18"/>'
-            '<ellipse cx="442" cy="646" rx="24.5" ry="18" fill="#FFFFFF" '
-            'stroke="#203170" stroke-width="18"/>'
-            '</svg>'
-        ).encode("utf-8")
-        renderer = QSvgRenderer(QByteArray(svg))
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
         pm = QPixmap(1026, 700)
         pm.fill(Qt.transparent)
         p = QPainter(pm)
@@ -186,6 +226,11 @@ def _svg_bubble() -> QPixmap:
         return pm
     except Exception:
         return QPixmap()
+
+
+def _svg_bubble() -> tuple[QPixmap, QPixmap]:
+    """返回 (主体, 尾巴) 两张气泡图。"""
+    return _render_svg(_BUBBLE_SVG_HEAD), _render_svg(_BUBBLE_SVG_TAIL)
 
 
 class WhaleWidget(QWidget):
@@ -209,6 +254,12 @@ class WhaleWidget(QWidget):
         self.turn_cost_close_ms = float(self.cfg.get("turn_cost_close_ms", 5000))
         self.volume = float(self.cfg.get("volume", 0.9))
         self.sound_set = self.cfg.get("sound_set", "duck")
+        # 预警：余额低于 / 今日已用超过阈值时提醒（开关关闭或阈值 <= 0 则不提醒）
+        self.alert_balance_on = bool(self.cfg.get("alert_balance_on", True))
+        self.alert_balance = float(self.cfg.get("alert_balance", 10.0))
+        self.alert_daily_on = bool(self.cfg.get("alert_daily_on", True))
+        self.alert_daily = float(self.cfg.get("alert_daily", 10.0))
+        self._bal_alert_armed = True   # 跌破阈值只提醒一次，回到阈值上方再重新武装
 
         self.state = {
             "h": self.cfg.get("pos", {}).get("h") or "right",
@@ -221,9 +272,12 @@ class WhaleWidget(QWidget):
         # ----- 余额状态 -----
         self.balance = None
         self.currency = "CNY"
-        self.today_usage = None
-        self.usage_dev = 0.0          # 今日已用偏离值（轮询同步值 - 每轮统计值）
-        self.ledger = Ledger(Path(__file__).resolve().parent.parent / "ledger.json")
+        # 账本 = 磁盘上的共享缓存：启动即读取（不必等第一次轮询），
+        # 旧位置的账本（项目目录 / 旧版 usage.json）一次性并入；
+        # 之后每次轮询都会对比文件、合并外部改动（多实例也不会互相覆盖）。
+        self.ledger = Ledger(ledger_path(), migrate_from=legacy_ledger_paths())
+        self.today_usage = self.ledger.today_usage
+        self.usage_dev = self.ledger.deviation
         self.status = "loading"
         self.message = ""
         self.shown = None
@@ -233,25 +287,36 @@ class WhaleWidget(QWidget):
         self.img = QPixmap(str(ASSETS / "DSniang1.png"))
         if self.img.isNull():
             self.img = QPixmap(str(ASSETS / "DSniang02.png"))
-        self.bubble_pm = _svg_bubble()
+        self.bubble_pm, self.bubble_tail_pm = _svg_bubble()
         self.movie = None
         self.gif_ok = False
         self._load_gif()
 
         # ----- 动画 -----
-        self.bubble_t = 0.0
+        self.bubble_t = 0.0           # 气泡总时间轴（分层进度 / 透明度）
+        self.pop_t = 0.0              # 缩放时间轴（0=收拢，1=展开；出场带弹性映射）
+        self._pop_in = True           # True=出场（走弹性曲线），False=退场（线性回缩）
         self.text_t = 0.0
         self.press_x = 1.0
         self.press_y = 1.0
-        self.anim_bubble = Animator(self._set_bubble_t, duration=200,
-                                    easing=QEasingCurve.OutCubic)
+        self.anim_bubble = Animator(self._set_bubble_t, duration=BUBBLE_IN_MS,
+                                    easing=QEasingCurve.Linear)
+        self.anim_pop = Animator(self._set_pop, duration=POP_IN_MS,
+                                 easing=QEasingCurve.Linear)
         self.anim_text = Animator(self._set_text_t, duration=160,
                                   easing=QEasingCurve.OutCubic)
         self.anim_press = Animator(self._set_press, duration=220,
                                    easing=QEasingCurve.OutBack)
         self.anim_amount = Animator(self._set_amount, duration=ANIM_MS,
                                     easing=QEasingCurve.OutCubic)
-        self._cost_value = 0.0
+        self._cost_value = 0.0        # 目标金额（上一轮消耗）
+        self._cost_shown = 0.0        # 正在显示的金额（连轮更新时从旧值滚到新值）
+        self.anim_cost = Animator(self._set_cost_shown, duration=COST_ROLL_MS,
+                                  easing=QEasingCurve.OutCubic)
+        self._token_value = 0         # 目标 token 数（上一轮总量）
+        self._token_shown = 0.0       # 正在显示的 token 数（同样平滑滚动）
+        self.anim_token = Animator(self._set_token_shown, duration=COST_ROLL_MS,
+                                   easing=QEasingCurve.OutCubic)
 
         # ----- 气泡/消耗 -----
         self.bubble_shown = False
@@ -259,7 +324,10 @@ class WhaleWidget(QWidget):
         self.random_lines = None
         self._restore_lines = False   # 收起后待恢复余额内容（等文字透明时再切，避免闪）
         self._cost_lines = False      # 仍按“消耗”内容绘制（收起淡出期间保持）
+        self._alert_lines = False     # 仍按“预警”内容绘制（同上）
         self.cost_bubble = False
+        # 冷却截止（time.monotonic 口径）：气泡完全收起后的这段时间内不生成新气泡
+        self._bubble_cool_until = 0.0
         self.bubble_timer = QTimer(self)
         self.bubble_timer.setSingleShot(True)
         self.bubble_timer.timeout.connect(self.hide_bubble)
@@ -277,6 +345,11 @@ class WhaleWidget(QWidget):
         self._text_delay = QTimer(self)
         self._text_delay.setSingleShot(True)
         self._text_delay.timeout.connect(self._text_goal)
+        # 气泡完全收起后自动恢复余额内容（此刻切换不可见，避免 _alert_lines/_cost_lines
+        # 残留——残留会让之后的点击、余额变动再也弹不出气泡）
+        self._restore_timer = QTimer(self)
+        self._restore_timer.setSingleShot(True)
+        self._restore_timer.timeout.connect(self._restore_after_hide)
 
         # ----- 音效 -----
         self._init_audio()
@@ -284,10 +357,13 @@ class WhaleWidget(QWidget):
         # ----- 拖拽 -----
         self._drag = None
 
-        # ----- 定时刷新 -----
+        # ----- 定时刷新（自适应节奏，见 _schedule_refresh）-----
+        self.refresh_ms = REFRESH_MS       # 当前轮询间隔
+        self._turn_since_poll = False      # 上次轮询之后有没有中转调用
         self.refresh_timer = QTimer(self)
+        self.refresh_timer.setSingleShot(True)   # 每次刷新完成后重新排期
         self.refresh_timer.timeout.connect(lambda: self.refresh_balance(False))
-        self.refresh_timer.start(REFRESH_MS)
+        self._schedule_refresh(True)
 
         # ----- 信号 -----
         self.balance_updated.connect(self._on_balance)
@@ -407,25 +483,33 @@ class WhaleWidget(QWidget):
         p.scale((-1.0 if flipped else 1.0) * self.press_x, self.press_y)
         p.translate(-w / 2, -h)
 
-        # 气泡
+        # 气泡：尾巴与主体分层出场（尾巴先冒 → 主体回弹展开；收起时反向）
         if self.bubble_t > 0.01:
             bw = w
             bh = w * 700 / 1026
+            tail_a = _smoothstep(self.bubble_t / TAIL_LEAD)
+            body_a = _smoothstep((self.bubble_t - BODY_LAG) / (1.0 - BODY_LAG))
             p.save()
-            p.setOpacity(self.bubble_t)
-            sc = 0.7 + 0.3 * self.bubble_t
-            p.translate(bw / 2, bh / 2)
+            # 以尾根（贴近鲸鱼那侧）为锚点缩放：气泡像从鲸鱼头顶吹出来 / 缩回去
+            sc = self._pop_scale()
+            ax, ay = bw * 0.40, bh * 0.95
+            p.translate(ax, ay)
             p.scale(sc, sc)
-            p.translate(-bw / 2, -bh / 2)
-            if not self.bubble_pm.isNull():
-                p.drawPixmap(QRect(0, 0, int(bw), int(bh)), self.bubble_pm)
-            if self._gif_visible() and self.movie:
-                pm = self.movie.currentPixmap()
-                if not pm.isNull():
-                    size = min(bw * 0.55, bh * 0.57)
-                    gx, gy = bw * 0.4425, bh * 0.38
-                    p.drawPixmap(QRect(int(gx - size / 2), int(gy - size / 2),
-                                       int(size), int(size)), pm)
+            p.translate(-ax, -ay)
+            if body_a > 0.01:
+                p.setOpacity(body_a)
+                if not self.bubble_pm.isNull():
+                    p.drawPixmap(QRect(0, 0, int(bw), int(bh)), self.bubble_pm)
+                if self._gif_visible() and self.movie:
+                    pm = self.movie.currentPixmap()
+                    if not pm.isNull():
+                        size = min(bw * 0.55, bh * 0.57)
+                        gx, gy = bw * 0.4425, bh * 0.38
+                        p.drawPixmap(QRect(int(gx - size / 2), int(gy - size / 2),
+                                           int(size), int(size)), pm)
+            if not self.bubble_tail_pm.isNull() and tail_a > 0.01:
+                p.setOpacity(tail_a)
+                p.drawPixmap(QRect(0, 0, int(bw), int(bh)), self.bubble_tail_pm)
             p.restore()
 
         # 文字
@@ -453,7 +537,10 @@ class WhaleWidget(QWidget):
 
         if self._cost_lines:
             labels = [("上一轮对话消耗:", COLOR_TEXT, 66, 600, False),
-                      (self._fmt_amount(self._cost_value, "CNY"), COLOR_RED, 128, 800, False)]
+                      (self._fmt_amount(self._cost_shown, "CNY"), COLOR_RED, 128, 800, False)]
+            tokens_line = self._fmt_tokens(self._token_shown)
+            if tokens_line:
+                labels.append((tokens_line, COLOR_HINT, 56, 400, False))
         elif self.bubble_random and isinstance(self.random_lines, list):
             labels = self._style_lines(self.random_lines)
         elif self.bubble_random and isinstance(self.random_lines, dict) and self.random_lines.get("gif"):
@@ -476,7 +563,9 @@ class WhaleWidget(QWidget):
                 rows = self._layout_rows(labels, base, ty)
                 self._text_rows_cache = (key, rows)
             # 整块文字按真实高度垂直居中（长文本换行后仍居中，不再下坠）
-            y = ty - sum(r["h"] for r in rows) / 2.0
+            # 随透明度淡入上浮（出现时从下方浮起、消失时下沉），更有「冒出来」的感觉
+            y = (ty + (_clamp01(1.0 - self.text_t) * TEXT_RISE * base)
+                 - sum(r["h"] for r in rows) / 2.0)
             for r in rows:
                 p.setFont(r["font"])
                 p.setPen(r["color"])
@@ -700,6 +789,17 @@ class WhaleWidget(QWidget):
     def _amount_value(self):
         return self.shown if self.shown is not None else self.balance
 
+    @staticmethod
+    def _fmt_tokens(v) -> str:
+        """本轮 token 用量（单位 K）：如 12.3K tokens；无数据时返回空串。"""
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(n) or n <= 0:
+            return ""
+        return f"{n / 1000.0:.1f}K tokens"
+
     def _fmt_deviation(self) -> str:
         """轮询同步后的偏离值：+0.12 / -0.04。
 
@@ -726,16 +826,36 @@ class WhaleWidget(QWidget):
         if self.status == "error":
             return (self.message or "获取失败 · 点击重试")[:14]
         if self.balance is None:
-            return "加载中…"
+            # 余额还没拉到：先把缓存里的“今日已用”显示出来（启动即读缓存）
+            return self._today_text() if self.today_usage is not None else "加载中…"
         return self._today_text()
 
     # ================= 余额 =================
+    def _schedule_refresh(self, active: bool | None = None):
+        """排下一次轮询：True → 回到基础间隔；False → 空闲降速 +100%；None → 不变。
+
+        自适应规则（少发无意义的请求）：
+        - 上一次轮询既没有中转调用、余额也和上次一致 → 间隔翻倍
+          （60s → 120s → 240s …，最长 REFRESH_MAX_MS）；
+        - 有中转调用（说明正在用）或余额与上次不一致（说明有消耗） → 重置回 60s。
+        """
+        if active is True:
+            self.refresh_ms = REFRESH_MS
+        elif active is False:
+            self.refresh_ms = min(REFRESH_MAX_MS,
+                                  int(self.refresh_ms * REFRESH_BACKOFF))
+        if self.refresh_timer.isActive():
+            self.refresh_timer.stop()
+        self.refresh_timer.start(int(self.refresh_ms))
+
     def refresh_balance(self, manual):
         if self.busy:
+            self._schedule_refresh()          # 上一轮还没回来：保持节奏，稍后再试
             return
         if not self.cfg.get("api_key"):
             self.status = "error"
             self.message = "未配置 API Key"
+            self._schedule_refresh()
             self.update()
             return
         self.busy = True
@@ -746,6 +866,7 @@ class WhaleWidget(QWidget):
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
+        payload = {"ok": False, "transient": True, "error": "刷新异常"}
         try:
             api_key = self.cfg.get("api_key", "")
             api_base = self.cfg.get("api_base", "https://api.deepseek.com")
@@ -758,14 +879,17 @@ class WhaleWidget(QWidget):
                 if self.use_token_mode and self.cfg.get("platform_token"):
                     u = fetch_platform_usage(self.cfg["platform_token"])
                     if u.get("amount") is not None:
-                        led.sync_external(u["amount"])
+                        led.sync_external(u["amount"], u.get("models"))
                         payload["usageMode"] = "token"
                 payload["todayUsage"] = led.today_usage
                 payload["todayDeviation"] = led.deviation
                 payload["isPeak"] = today_peak_now()
-            self.balance_updated.emit(payload)
+        except Exception as e:
+            # 兜底：异常也要回到 GUI 线程，否则轮询不再排期
+            payload = {"ok": False, "transient": True, "error": f"刷新异常: {e}"}
         finally:
             self.busy = False
+        self.balance_updated.emit(payload)
 
     def _on_balance(self, payload):
         if not payload.get("ok"):
@@ -775,12 +899,17 @@ class WhaleWidget(QWidget):
             else:
                 self.status = "error"
                 self.message = str(payload.get("error") or "获取失败")
+            self._schedule_refresh()          # 失败：保持当前节奏
             self.update()
             return
         nb = float(payload["totalBalance"])
         nc = str(payload.get("currency") or "CNY")
         changed = self.balance is not None and (nb != self.balance or nc != self.currency)
         currency_changed = self.currency is not None and nc != self.currency
+        # 自适应轮询：有中转调用或余额与上次不一致 → 重置；两者都没有 → 空闲降速
+        active = bool(changed or self._turn_since_poll)
+        self._turn_since_poll = False
+        self._schedule_refresh(active)
         self.balance = nb
         self.currency = nc
         self.message = ""
@@ -788,7 +917,10 @@ class WhaleWidget(QWidget):
         dev = payload.get("todayDeviation")
         self.usage_dev = float(dev) if isinstance(dev, (int, float)) else 0.0
         self.status = "ok"
-        if changed and not currency_changed and not self.cost_bubble:
+        self._check_daily_alert()
+        self._check_balance_alert()
+        if (changed and not currency_changed
+                and not (self.cost_bubble or self._alert_lines)):
             self.show_bubble()
             self._animate_amount(self._amount_value(), nb)
         else:
@@ -809,35 +941,83 @@ class WhaleWidget(QWidget):
         self.update()
 
     # ================= 气泡 =================
-    def show_bubble(self):
+    def _bubble_exists(self) -> bool:
+        """气泡是否“存在”：显示中，或还在弹出/收起的动画里（存在时只延长，不重播）。"""
+        return self.bubble_shown or self.bubble_t > 0.01
+
+    def show_bubble(self, force=False):
         if not self.bubble_on or self.cost_bubble:
+            return
+        exists = self._bubble_exists()
+        # 冷却：刚收起的一小段时间内不再自动生成气泡（避免“消失→立刻又冒出来”）
+        if not exists and not force and time.monotonic() < self._bubble_cool_until:
             return
         if self.bubble_timer.isActive():
             self.bubble_timer.stop()
+        self._restore_timer.stop()
+        self._bubble_cool_until = 0.0
         self.bubble_shown = True
-        # 切回余额内容：文字已全透明时可以直接切；若还在淡出（快速连点重开），
-        # 直接切会看到“余额闪一下”，于是推迟到 _text_goal（那时已透明）。
+        # 切回余额内容：文字已全透明时可以直接切（预警/台词/计费内容一并清掉）；
+        # 若还在淡出（快速连点重开），直接切会看到“余额闪一下”，
+        # 于是推迟到 _text_goal（那时已透明）。
         if self.text_t <= 0.01:
             self._restore_balance_lines()
         else:
             self._restore_lines = True
-        self.anim_bubble.start(0.0, 1.0, 220, QEasingCurve.InOutSine)
-        self._text_delay.start(360)   # 文字延迟 0.36s 出现
+        # 已经显示着就别从 0 重播（否则余额刷新时气泡会闪一下），只把停留时间延长；
+        # 只有新气泡 / 收起中重开才重新安排文字出现（正在播的延迟不重置）
+        self._pop_open()
+        if not exists or not self._text_delay.isActive():
+            self._text_delay.start(420)   # 文字等气泡形状展开得差不多再出现
         self.bubble_timer.start(BUBBLE_MS)
+
+    def _pop_open(self):
+        """气泡出现：从头弹出（尾巴先冒 → 主体回弹展开），已显示则补到完全展开。"""
+        if self.bubble_t < 0.05:
+            self._pop_in = True
+            self.anim_bubble.start(0.0, 1.0, BUBBLE_IN_MS, QEasingCurve.Linear)
+            self.anim_pop.start(0.0, 1.0, POP_IN_MS, QEasingCurve.Linear)
+        else:
+            if self.bubble_t < 1.0:
+                self.anim_bubble.start(self.bubble_t, 1.0, 160, QEasingCurve.OutCubic)
+            if self.pop_t < 1.0:
+                self._pop_in = True
+                self.anim_pop.start(self.pop_t, 1.0, 240, QEasingCurve.Linear)
+
+    def _pop_close(self):
+        """气泡收起：缩回（透明度先慢后快地消散，尾巴最后消失）。"""
+        self._pop_in = False
+        self.anim_bubble.start(self.bubble_t, 0.0, BUBBLE_OUT_MS, QEasingCurve.InCubic)
+        self.anim_pop.start(self.pop_t, 0.0, BUBBLE_OUT_MS, QEasingCurve.InOutSine)
 
     def _restore_balance_lines(self):
         """恢复成余额内容（只在文字全透明时调用，否则会看到切换过程）。"""
         self._restore_lines = False
         self._cost_lines = False
+        self._alert_lines = False
         self.bubble_random = False
         self.random_lines = None
         self._stop_gif()
 
-    def _text_goal(self):
-        if self._restore_lines:          # 此刻文字全透明，恢复余额内容不会闪
+    def _restore_after_hide(self):
+        """气泡已完全收起：落地待恢复的余额内容（清掉预警/计费/台词残留标记）。"""
+        if self._restore_lines and not self.bubble_shown and self.text_t <= 0.01:
             self._restore_balance_lines()
-        if self.bubble_shown and not self.cost_bubble:
-            self.anim_text.start(0.0, 1.0, 200, QEasingCurve.InOutSine)
+
+    def _text_goal(self):
+        # 当前显示的是不是别的文字（计费/预警/台词）——恢复后内容会变
+        had_other = self._cost_lines or self._alert_lines or self.bubble_random
+        if self._restore_lines:
+            if had_other and self.text_t > 0.5:
+                # 别的文字还完整显示着（如台词被余额刷新打断）：先淡出再切，别硬切
+                self._swap_bubble_content(self._restore_balance_lines)
+                return
+            # 文字已（快）透明：直接恢复余额内容不会闪
+            self._restore_balance_lines()
+        # 内容被切回余额、或文字还没显示完 → 淡入；已完整显示的余额内容不重播淡入
+        if (self.bubble_shown and not self.cost_bubble
+                and (had_other or self.text_t < 0.99)):
+            self.anim_text.start(0.0, 1.0, 230, QEasingCurve.OutCubic)
 
     def hide_bubble(self):
         self.bubble_timer.stop()
@@ -851,13 +1031,29 @@ class WhaleWidget(QWidget):
         # 保留当前台词（不清 random_lines）：让气泡带着原文字自然淡出。
         # 否则收起瞬间文字会先变回余额内容，看起来就是“收起到一半闪一下”。
         self._restore_lines = True
-        self.anim_bubble.start(self.bubble_t, 0.0, 220, QEasingCurve.InOutSine)
-        self.anim_text.start(self.text_t, 0.0, 150, QEasingCurve.InOutSine)
+        self._pop_close()
+        self.anim_text.start(self.text_t, 0.0, 170, QEasingCurve.InCubic)
+        # 淡出收尾后再恢复内容：此刻画面看不见，不会闪
+        self._restore_timer.start(BUBBLE_OUT_MS + 80)
+        # 收起动画 + 冷却：这段时间内不再生成新气泡（短时间不会连续冒泡）
+        self._bubble_cool_until = (time.monotonic()
+                                   + (BUBBLE_OUT_MS + BUBBLE_COOLDOWN_MS) / 1000.0)
         self._stop_gif()
 
     def _set_bubble_t(self, v):
         self.bubble_t = v
         self.update()
+
+    def _set_pop(self, v):
+        self.pop_t = v
+        self.update()
+
+    def _pop_scale(self) -> float:
+        """当前气泡缩放：出场沿弹性曲线（带轻微过冲），收起时线性回缩。"""
+        t = _clamp01(self.pop_t)
+        if self._pop_in:
+            t = _pop_curve(t)
+        return POP_LOAD + (1.0 - POP_LOAD) * t
 
     def _set_text_t(self, v):
         self.text_t = v
@@ -931,52 +1127,108 @@ class WhaleWidget(QWidget):
 
     # ================= 消耗泡泡 =================
     def _on_turn_used(self, model, usage, cost, tokens):
-        # 每轮消耗立刻叠到“今日已用”（不等轮询；轮询同步时再给 ±偏离值）
+        # 有中转调用 = 正在使用：轮询节奏重置回基础间隔（空闲降速的逆操作），
+        # 避免“刚开始用却要等下一次慢轮询”的观感
+        self._turn_since_poll = True
+        if self.refresh_ms > REFRESH_MS and self.refresh_timer.isActive():
+            self._schedule_refresh(True)
+        # 每轮消耗立刻叠到“今日已用”并按模型记账（不等轮询；同步时再给 ±偏离值）
         try:
-            self.today_usage = self.ledger.add_turn_cost(float(cost))
+            self.today_usage = self.ledger.add_turn_cost(float(cost), model, tokens)
             self.update()
         except Exception:
             pass
         if self.turn_cost_on:
-            self.show_cost_bubble(cost)
+            self.show_cost_bubble(cost, tokens)
+        self._check_daily_alert()
 
     def _apply_cost_lines(self):
         """把气泡内容切到“上一轮消耗”（可作为 _swap_bubble_content 的回调）。"""
         self._cost_lines = True
+        self._alert_lines = False
         self.bubble_random = False
         self.random_lines = None
         self._stop_gif()
 
-    def show_cost_bubble(self, amount):
+    def show_cost_bubble(self, amount, tokens=0, force=False):
         if not self.bubble_on or not self.turn_cost_on:
+            return
+        exists = self._bubble_exists()
+        # 冷却：气泡刚收起的一小段时间内不再自动生成（防“刚消失又冒出来”）
+        if not exists and not force and time.monotonic() < self._bubble_cool_until:
             return
         self.cost_bubble = True
         self.cost_timer.stop()
         self.bubble_timer.stop()         # 普通气泡的自动关闭计时不再适用
         self._text_delay.stop()
+        self._bubble_cool_until = 0.0
         self._cost_value = float(amount)
+        try:
+            self._token_value = max(0, int(tokens or 0))
+        except (TypeError, ValueError):
+            self._token_value = 0
         self.bubble_shown = True
         self._restore_lines = False      # 内容由消耗泡泡接管，无需再恢复
         if self._cost_lines:
-            # 连轮触发：气泡已在显示计费内容 → 原地更新金额，不重播弹出/淡入。
-            # 否则每轮都把气泡从 0 放大一次、文字闪一下，看起来就是“显示异常”。
+            # 连轮触发：气泡已在显示计费内容 → 金额/token 从当前值滚到新值（不硬切），
+            # 气泡/文字只补到完全显示并延长停留，不重播任何生成动画。
             self._swap_timer.stop()
             self._swap_apply_fn = None
-            if self.bubble_t < 1.0:
-                self.anim_bubble.start(self.bubble_t, 1.0, 160, QEasingCurve.OutCubic)
-            if self.text_t < 1.0:
-                self.anim_text.start(self.text_t, 1.0, 140, QEasingCurve.OutCubic)
+            self._roll_cost()
+            self._pop_open()
+            if self.text_t < 0.99:
+                self.anim_text.start(self.text_t if self.text_t > 0.01 else 0.0,
+                                     1.0, 200, QEasingCurve.OutCubic)
         else:
-            self.anim_bubble.start(0.0, 1.0, 220, QEasingCurve.InOutSine)
-            if self.text_t <= 0.01:
-                # 文字不可见：直接切内容并淡入
+            self._cost_shown = self._cost_value    # 首次显示消耗：直接显示目标值
+            self._token_shown = float(self._token_value)
+            self.anim_cost.stop()
+            self.anim_token.stop()
+            if not exists:
+                # 气泡不在：正常弹出
                 self._apply_cost_lines()
-                self.anim_text.start(0.0, 1.0, 200, QEasingCurve.InOutSine)
+                self._pop_open()
+                self.anim_text.start(0.0, 1.0, 220, QEasingCurve.OutCubic)
+            elif self.bubble_t < 0.999 or self.pop_t < 0.999:
+                # 与轮询气泡同时触发（气泡还在出场动画里）：直接改文本、把气泡补到
+                # 完全展开，不重播生成动画（否则看起来就是“又快速生成了一个气泡”）
+                self._apply_cost_lines()
+                self._pop_open()
+                if self.text_t < 0.99:
+                    self.anim_text.start(self.text_t if self.text_t > 0.01 else 0.0,
+                                         1.0, 200, QEasingCurve.OutCubic)
             else:
-                # 正显示着别的文字：先淡出再切（内容在 _swap_apply 里落地）
+                # 稳定显示中：形状不动，内容先淡出再切（更柔和）
+                self._pop_open()
                 self._swap_bubble_content(self._apply_cost_lines)
         if self.turn_cost_close_ms > 0:
             self.cost_timer.start(int(self.turn_cost_close_ms))
+        self.update()
+
+    def _roll_cost(self):
+        """连轮切换：金额与 token 都从正在显示的值平滑滚到新值（差得越多滚得越久）。"""
+        self._roll_shown(self.anim_cost, "_cost_shown", self._cost_value, 0.005, 0.05)
+        self._roll_shown(self.anim_token, "_token_shown", float(self._token_value), 0.5, 50.0)
+
+    def _roll_shown(self, anim, attr, target, min_delta, big_delta):
+        """用动画把某个展示值滚到目标（差值很小时直接落值，不白跑动画）。"""
+        cur = float(getattr(self, attr))
+        target = float(target)
+        delta = abs(target - cur)
+        if delta < min_delta:
+            anim.stop()
+            setattr(self, attr, target)
+        else:
+            dur = COST_ROLL_MS if delta >= big_delta else max(160, int(COST_ROLL_MS * 0.6))
+            anim.start(cur, target, dur, QEasingCurve.OutCubic)
+        self.update()
+
+    def _set_cost_shown(self, v):
+        self._cost_shown = v
+        self.update()
+
+    def _set_token_shown(self, v):
+        self._token_shown = v
         self.update()
 
     def hide_cost_bubble(self):
@@ -984,6 +1236,96 @@ class WhaleWidget(QWidget):
         self.cost_bubble = False
         # _cost_lines 保留到文字透明后再恢复，否则收起淡出时会闪回余额内容
         self.hide_bubble()
+
+    # ================= 预警 =================
+    def _check_balance_alert(self):
+        """余额预警：跌破阈值提醒一次；回到阈值上方后重新武装。"""
+        if not self.alert_balance_on or self.alert_balance <= 0 or self.balance is None:
+            return
+        try:
+            b = float(self.balance)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(b):
+            return
+        if b >= self.alert_balance:
+            self._bal_alert_armed = True
+            return
+        if not self._bal_alert_armed:
+            return
+        self._bal_alert_armed = False
+        line = self._fmt_amount(b, self.currency)
+        warn = "预警线 " + self._fmt_amount(self.alert_balance, self.currency)
+        self.fire_alert(
+            "余额预警",
+            f"余额不足：{line}（{warn}）",
+            [{"t": "余额预警", "s": "A"},
+             {"t": line, "s": "P", "c": "#e0433f"},
+             {"t": "低于" + warn, "s": "C"}],
+        )
+
+    def _check_daily_alert(self):
+        """每日使用预警：今日已用每超过一个阈值档位提醒一次（重启后不重复）。"""
+        if not self.alert_daily_on or self.alert_daily <= 0 or self.today_usage is None:
+            return
+        try:
+            u = float(self.today_usage)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(u) or u < self.alert_daily:
+            return
+        level = int(u // self.alert_daily)
+        if level <= self.ledger.alert_level:
+            return
+        self.ledger.set_alert_level(level)      # 先落盘：避免重启后同一档位再提醒
+        amount = self._fmt_amount(u, self.currency)
+        warn = self._fmt_amount(self.alert_daily, self.currency)
+        tip = f"超过预警线 {warn}" + (f"（{level} 倍）" if level > 1 else "")
+        self.fire_alert(
+            "每日使用预警",
+            f"今日已用 {amount}，{tip}",
+            [{"t": "每日使用预警", "s": "A"},
+             {"t": "今日已用 " + amount, "s": "P", "c": "#e0433f"},
+             {"t": tip, "s": "C"}],
+        )
+
+    def fire_alert(self, title: str, message: str, lines=None):
+        """预警提醒：托盘系统通知 + 气泡（两者都不可用时至少保留一个）。"""
+        try:
+            tray = getattr(self, "tray", None)
+            if tray is not None and tray.isVisible():
+                tray.showMessage(title, message, QSystemTrayIcon.Warning, 8000)
+        except Exception:
+            pass
+        if self.bubble_on and lines:
+            self.show_alert_bubble(lines)
+
+    def show_alert_bubble(self, lines, hold_ms: int = ALERT_BUBBLE_MS):
+        """切到预警内容并停留一段时间（不受普通气泡 5s 收起限制；预警无视气泡冷却）。"""
+        self.cost_timer.stop()
+        self.cost_bubble = False
+        self.bubble_timer.stop()
+        self._text_delay.stop()       # 别让上次弹气泡残留的文字延迟重播淡入
+        self._bubble_cool_until = 0.0
+        self._restore_lines = False
+        self.bubble_shown = True
+        self._alert_hold_ms = int(hold_ms)      # 切换内容完成后按这个时长停留
+        if self.text_t <= 0.01:
+            self._apply_alert_lines(lines)
+            self._pop_open()
+            self.anim_text.start(0.0, 1.0, 230, QEasingCurve.OutCubic)
+        else:
+            self._swap_bubble_content(lambda: self._apply_alert_lines(lines))
+        self.bubble_timer.start(int(hold_ms))
+        self.update()
+
+    def _apply_alert_lines(self, lines):
+        """把气泡内容切到预警（可作为 _swap_bubble_content 的回调）。"""
+        self._cost_lines = False
+        self._alert_lines = True
+        self.bubble_random = True     # 复用台词绘制路径：点击即收起
+        self.random_lines = lines
+        self._stop_gif()
 
     # ================= 鼠标 =================
     def mousePressEvent(self, ev):
@@ -1027,7 +1369,7 @@ class WhaleWidget(QWidget):
             self.hide_cost_bubble()
             return
         if not self.bubble_shown:
-            self.show_bubble()
+            self.show_bubble(force=True)   # 用户主动点击：无视冷却
             self.refresh_balance(True)
             return
         if self.bubble_random:
@@ -1040,6 +1382,7 @@ class WhaleWidget(QWidget):
     def _apply_random_lines(self, lines):
         """把气泡内容切到随机台词（可作为 _swap_bubble_content 的回调）。"""
         self._cost_lines = False
+        self._alert_lines = False
         self.bubble_random = True
         self.random_lines = lines
         if isinstance(lines, dict) and lines.get("gif"):
@@ -1060,13 +1403,15 @@ class WhaleWidget(QWidget):
         if apply is None:
             return
         apply()
-        # 重置自动关闭计时：普通气泡 5s，消耗泡泡按设置
+        # 重置自动关闭计时：消耗泡泡按设置，预警按自己的停留时长，普通气泡 5s
         if self.cost_bubble:
             if self.turn_cost_close_ms > 0:
                 self.cost_timer.start(int(self.turn_cost_close_ms))
+        elif self._alert_lines:
+            self.bubble_timer.start(int(getattr(self, "_alert_hold_ms", ALERT_BUBBLE_MS)))
         else:
             self.bubble_timer.start(BUBBLE_MS)
-        self.anim_text.start(0.0, 1.0, 220, QEasingCurve.InOutSine)
+        self.anim_text.start(0.0, 1.0, 230, QEasingCurve.OutCubic)
         self.update()
 
     def _snap_after_drag(self):
@@ -1215,6 +1560,7 @@ class WhaleWidget(QWidget):
     def contextMenuEvent(self, ev):
         menu = QMenu(self)
         act_settings = menu.addAction("设置…")
+        act_stats = menu.addAction("账单…")
         act_refresh = menu.addAction("刷新余额")
         act_toggle = menu.addAction("隐藏" if self.isVisible() else "显示")
         menu.addSeparator()
@@ -1222,6 +1568,8 @@ class WhaleWidget(QWidget):
         act = menu.exec(ev.globalPos())
         if act == act_settings:
             self.open_settings()
+        elif act == act_stats:
+            self.open_stats()
         elif act == act_refresh:
             self.refresh_balance(True)
         elif act == act_toggle:
@@ -1236,11 +1584,13 @@ class WhaleWidget(QWidget):
         self.tray.setToolTip("DeepSeek 小鲸鱼")
         menu = QMenu()
         act_settings = menu.addAction("设置…")
+        act_stats = menu.addAction("账单…")
         act_refresh = menu.addAction("刷新余额")
         act_show = menu.addAction("显示/隐藏")
         menu.addSeparator()
         act_quit = menu.addAction("退出")
         act_settings.triggered.connect(self.open_settings)
+        act_stats.triggered.connect(self.open_stats)
         act_refresh.triggered.connect(lambda: self.refresh_balance(True))
         act_show.triggered.connect(lambda: self.setVisible(not self.isVisible()))
         act_quit.triggered.connect(QApplication.quit)
@@ -1256,6 +1606,13 @@ class WhaleWidget(QWidget):
             self._apply_cfg()
         return dlg
 
+    def open_stats(self):
+        """账单对话框：最近 7 天 / 30 天每日消耗 + 按模型汇总。"""
+        from .ui.stats_dialog import StatsDialog
+        dlg = StatsDialog(self, self.ledger)
+        dlg.exec()
+        return dlg
+
     def _apply_cfg(self):
         self.scale = float(self.cfg.get("scale", 1.5))
         self.use_token_mode = self.cfg.get("usage_mode") == "token"
@@ -1265,6 +1622,10 @@ class WhaleWidget(QWidget):
         self.turn_cost_close_ms = float(self.cfg.get("turn_cost_close_ms", 5000))
         self.volume = float(self.cfg.get("volume", 0.9))
         self.sound_set = self.cfg.get("sound_set", "duck")
+        self.alert_balance_on = bool(self.cfg.get("alert_balance_on", True))
+        self.alert_balance = float(self.cfg.get("alert_balance", 10.0))
+        self.alert_daily_on = bool(self.cfg.get("alert_daily_on", True))
+        self.alert_daily = float(self.cfg.get("alert_daily", 10.0))
         if self._players:
             for _, out in (v[1] for v in self._players.values()):
                 out.setVolume(self.volume)

@@ -36,6 +36,11 @@ DEFAULTS = {
     "turn_cost_close_ms": 5000,  # 0=不自动关闭
     "peak_mode": "default",      # default / liangwen / qiangqiang
     "pos": {"h": "right", "v": "bottom", "hOff": 0, "vOff": 0, "x": None, "y": None},
+    # 预警：余额低于阈值 / 今日已用超过阈值（0=关闭该项阈值判断）
+    "alert_balance_on": True,
+    "alert_balance": 10.0,
+    "alert_daily_on": True,
+    "alert_daily": 10.0,
     # 记账账本与历史（跨天自动归档）
     "ledger": {"date": "", "lastBalance": None, "lastCurrency": "", "todayUsage": 0.0,
                "history": {}},
@@ -61,6 +66,38 @@ def config_path() -> Path:
     if portable.exists():
         return portable
     return _appdata_dir() / "config.json"
+
+
+def ledger_path() -> Path:
+    """账本（缓存）路径：与 config.json 同目录。
+
+    统一成一份缓存，源码运行与打包版看到的是**同一个**“今日已用”：
+      1. WHALE_PET_LEDGER_PATH 显式指定
+      2. 否则 config.json 所在目录（便携 = exe/项目目录，否则 %APPDATA%/WhalePet/）
+    注意 PyInstaller onefile：运行期的 __file__ 在临时解包目录，若按“源码目录”推断
+    会把账本写进临时目录、退出即丢，长期统计无从谈起。
+    """
+    env = os.environ.get("WHALE_PET_LEDGER_PATH")
+    if env:
+        return Path(env)
+    return config_path().parent / "ledger.json"
+
+
+def legacy_ledger_paths() -> list[Path]:
+    """旧位置的账本 / 旧版缓存（启动时一次性并入，见 balance.Ledger._migrate）。"""
+    primary = ledger_path()
+    out: list[Path] = []
+    seen = set()
+    for p in (_portable_dir() / "ledger.json", _appdata_dir() / "usage.json"):
+        try:
+            key = str(p.resolve()).lower()
+        except OSError:
+            key = str(p).lower()
+        if key in seen or p == primary or not p.exists():
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
 
 
 def _deep_merge(base: dict, extra: dict) -> dict:
