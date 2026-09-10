@@ -28,10 +28,14 @@ python main.py
 ## 打包为独立 exe
 
 ```powershell
-build.bat
+release.bat           # 仅打包，产物 dist\WhalePet.exe
+release.bat 0.3       # 打包 + 提交 + 打标签 v0.3 + 推送 + 发布 GitHub Release
 ```
 
-产物：`dist\WhalePet.exe`（单文件，含资源）。首次运行同样弹出配置窗口。
+产物：`dist\WhalePet.exe`（单文件，含资源，约 53 MB）。首次运行同样弹出配置窗口。
+
+发布模式会自动生成 Release 说明（含 SHA256 校验值与下载说明），发布前会二次确认；
+需本机已安装 [GitHub CLI](https://cli.github.com/) 并执行过 `gh auth login`。
 
 ## 使用方式
 
@@ -69,7 +73,8 @@ resp = client.chat.completions.create(model="deepseek-chat", messages=[...])
 ```text
 Whale-Pet/
 ├── main.py                 # 入口（GUI + 中转服务启动 + 首次配置引导）
-├── build.bat               # PyInstaller 打包脚本
+├── release.bat             # 一键构建 / 发布（PyInstaller + GitHub Release）
+├── WhalePet.spec           # PyInstaller 打包配置（改打包参数改这里）
 ├── requirements.txt        # PySide6 + requests
 ├── pet/
 │   ├── config.py           # 配置持久化（首次填入后缓存）
