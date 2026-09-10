@@ -24,8 +24,12 @@ if not defined HTTPS_PROXY set "HTTPS_PROXY=socks5://127.0.0.1:10808"
 set "HTTP_PROXY=%HTTPS_PROXY%"
 
 if defined VER (
-  echo %TAG% | findstr /r "^v[0-9][0-9]*\.[0-9][0-9.]*$" >nul
-  if errorlevel 1 (
+  rem 只允许数字与小数点，且以数字开头（如 0.3 / 0.3.1）
+  set "BADVER="
+  for /f "tokens=1 delims=0123456789." %%A in ("%VER%") do set "BADVER=1"
+  echo %VER% | findstr /r "^[0-9]" >nul
+  if errorlevel 1 set "BADVER=1"
+  if defined BADVER (
     echo [错误] 版本号格式不对，应形如：release.bat 0.3
     exit /b 1
   )
@@ -168,7 +172,8 @@ set "NOTES=%TEMP%\whalepet-%TAG%-notes.md"
   echo - 未做代码签名，Windows SmartScreen 可能提示「未知发布者」，选择「仍要运行」即可。
   echo - 由 `release.bat` 构建发布（PyInstaller 单文件打包，配置见 `WhalePet.spec`）。
   echo - 源码与更新日志：https://github.com/%REPO%
-  echo - 美术素材、峰谷定价规则与气泡视觉参数来自 [DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)（MIT License），详见仓库 README 的「致谢」。
+  rem 本块内 ASCII 括号须写成插入符转义，否则会破坏 cmd 的分组解析
+  echo - 美术素材、峰谷定价规则与气泡视觉参数来自 [DeepSeek-Balance-Whale-Widget]^(https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget^)（MIT License），详见仓库 README 的「致谢」。
 ) > "%NOTES%"
 
 gh release create "%TAG%" "%EXE%" --title "%TAG%" --notes-file "%NOTES%" --verify-tag
