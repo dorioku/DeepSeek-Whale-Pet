@@ -8,7 +8,7 @@ DeepSeek 小鲸鱼桌宠 —— 独立程序入口。
   - 首次启动弹设置对话框，填入 API Key 后缓存到本地配置文件
 
 运行：python main.py
-打包：build.bat（PyInstaller 单文件 exe）
+打包：python release.py（构建 / 发布见 README）
 """
 from __future__ import annotations
 
