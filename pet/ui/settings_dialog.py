@@ -5,21 +5,26 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QSpinBox,
+    QWidget,
 )
 
 from ..config import load_config, save_config
+from .theme import GlassDialog
+
+_ASSETS = Path(__file__).resolve().parents[2] / "assets"
 
 
-class SettingsDialog(QDialog):
+class SettingsDialog(GlassDialog):
     def __init__(self, parent: QWidget | None = None, first_run: bool = False):
-        super().__init__(parent)
-        self.setWindowTitle("小鲸鱼设置" + ("（首次启动）" if first_run else ""))
-        self.setMinimumWidth(420)
+        super().__init__(parent, "小鲸鱼设置" + ("（首次启动）" if first_run else ""),
+                         icon_path=str(_ASSETS / "DSniang1.png"))
+        self.setMinimumWidth(470)
         self.cfg = load_config()
 
         form = QFormLayout()
@@ -108,6 +113,9 @@ class SettingsDialog(QDialog):
         self.turn_cost_close.setSuffix(" 秒")
         self.turn_cost_close.setValue(int(
             self.cfg.get("turn_cost_close_ms", 5000) / 1000))
+        self.turn_cost_close.setToolTip(
+            "消耗气泡自动收起时间。气泡都是自动收起的（不存在永久气泡）；"
+            "0 = 用默认 5 秒。点击气泡只会切换台词并重新计时 5 秒，不会关闭气泡。")
         row = QHBoxLayout()
         row.addWidget(self.turn_cost_on)
         row.addWidget(QLabel("自动关闭"))
@@ -153,20 +161,35 @@ class SettingsDialog(QDialog):
         self.peak_mode.setCurrentIndex(max(0, idx))
         form.addRow("峰谷文案", self.peak_mode)
 
+        # --- 台词词典：随机台词 / 峰谷文案都在独立的词典文件里，用「词典页」编辑 ---
+        self.dict_btn = QPushButton("打开词典页…")
+        self.dict_btn.setToolTip(
+            "随机台词 / 峰谷文案的编辑页面：改完保存即生效（无需重启）。\n"
+            "词典文件默认在 %APPDATA%\\WhalePet\\phrases.json（便携模式 = exe 同目录）；\n"
+            "页面里也有「用文本编辑器打开」，想直接改 JSON 也行。")
+        self.dict_btn.clicked.connect(self._open_phrases)
+        form.addRow("台词词典", self.dict_btn)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.Ok).setObjectName("primary")   # Win11 主按钮配色
         if first_run:
             buttons.button(QDialogButtonBox.Cancel).setText("暂时跳过")
 
-        lay = QVBoxLayout(self)
         if first_run:
             tip = QLabel("首次启动：请填入 DeepSeek API Key（必填）。\n"
                          "之后使用任意 OpenAI 兼容客户端时，把 base_url 指向本地中转即可统计消耗。")
             tip.setWordWrap(True)
-            lay.addWidget(tip)
-        lay.addLayout(form)
-        lay.addWidget(buttons)
+            tip.setObjectName("hint")
+            self.body.addWidget(tip)
+        self.body.addLayout(form)
+        self.body.addWidget(buttons)
+
+    def _open_phrases(self):
+        """打开「台词词典」页面（保存后桌宠会自动重载词典，无需重启）。"""
+        from .phrases_dialog import PhrasesDialog
+        PhrasesDialog(self).exec()
 
     def accept(self):
         self.cfg["api_key"] = self.api_key.text().strip()

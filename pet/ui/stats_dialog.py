@@ -9,11 +9,17 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView, QLabel,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QDialogButtonBox, QHBoxLayout, QHeaderView, QLabel,
+    QTableWidget, QTableWidgetItem, QWidget,
 )
+
+from .theme import GlassDialog
+
+_ASSETS = Path(__file__).resolve().parents[2] / "assets"
 
 PERIODS = [("今天", 1), ("最近 7 天", 7), ("最近 30 天", 30), ("最近 90 天", 90)]
 
@@ -27,13 +33,14 @@ def _fmt_tokens(n) -> str:
     return f"{n:,}"
 
 
-class StatsDialog(QDialog):
+class StatsDialog(GlassDialog):
     """账单：按模型汇总表 + 每日明细表。"""
 
     def __init__(self, parent: QWidget | None = None, ledger=None):
-        super().__init__(parent)
-        self.setWindowTitle("小鲸鱼账单")
-        self.resize(620, 660)      # 14 天以内基本不用滚动
+        super().__init__(parent, "小鲸鱼账单",
+                         icon_path=str(_ASSETS / "DSniang1.png"), resizable=True)
+        self.resize(640, 680)      # 14 天以内基本不用滚动
+        self.setMinimumSize(520, 420)
         self.ledger = ledger
 
         top = QHBoxLayout()
@@ -54,12 +61,12 @@ class StatsDialog(QDialog):
         tip = QLabel("金额为“今日已用”口径（记账=余额差值，令牌=平台用量）；"
                      "按模型为本地中转统计（令牌模式以平台按模型数据为准）。")
         tip.setWordWrap(True)
-        tip.setStyleSheet("color: #888;")
+        tip.setObjectName("hint")
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
 
-        lay = QVBoxLayout(self)
+        lay = self.body
         lay.addLayout(top)
         lay.addWidget(QLabel("按模型"))
         lay.addWidget(self.model_table, 1)

@@ -164,8 +164,9 @@ class Ledger:
     - todayUsage：余额差值累加的今日已用（权威值）——重启后拿上次观测值与
       当前余额作差，未挂载时段的消耗也能算进去；
     - turnCost：本地中转按每轮 usage 换算的累计消耗，每轮立刻叠加；
-    - syncedTurnCost/deviation：上次同步（轮询/平台用量）时的 turnCost
-      及其偏离值 = todayUsage - turnCost（正 = 实际比本地统计多）；
+    - syncedUsage/syncedTurnCost/deviation：上次同步（轮询/平台用量）时的
+      今日已用与 turnCost 快照；偏离值 = 本次同步新增的实际消耗 - 新增的每轮预估
+      （只反映当前轮 / 最近一段间隔，正 = 实际比本地统计多；下次同步重新起算）；
     - models：按模型累计（cost/tokens/turns），每轮立刻叠加；
       modelsPlatform/modelsSync 是平台用量接口给出的权威按模型值及其同步快照，
       展示值 = 平台权威值 + 上次同步后新发生的本地消耗（同一套“基准 + 增量”）；
@@ -226,6 +227,10 @@ class Ledger:
         data.setdefault("todayUsage", 0.0)
         data.setdefault("turnCost", 0.0)
         data.setdefault("syncedTurnCost", 0.0)
+        # 偏离基准：syncedUsage = 上次同步时的权威今日已用（None = 当天还没同步过）。
+        # 旧账本没有该字段 → 当作“还没同步”：第一次同步只立基准，
+        # 避免把“当天累计差值”误当成“当前轮偏离”。
+        data.setdefault("syncedUsage", None)
         data.setdefault("deviation", 0.0)
         # 按模型：本地每轮累计 + 平台权威按模型值及其同步快照
         data.setdefault("models", {})
@@ -276,7 +281,8 @@ class Ledger:
                 return True
             return False
 
-    _COUNTERS = ("todayUsage", "turnCost", "syncedTurnCost", "alertLevel")
+    _COUNTERS = ("todayUsage", "turnCost", "syncedTurnCost", "syncedUsage",
+                 "alertLevel")
 
     def _merge(self, other: dict) -> bool:
         """把另一份账本（另一个实例写入 / 旧位置迁移）并入本账本。
@@ -391,6 +397,7 @@ class Ledger:
             "todayUsage": 0.0,
             "turnCost": 0.0,
             "syncedTurnCost": 0.0,
+            "syncedUsage": None,
             "deviation": 0.0,
             "models": {},
             "modelsSync": {},
@@ -399,10 +406,24 @@ class Ledger:
         })
 
     def _sync_deviation(self):
-        """同步：把当前每轮累计当作基准，算出与实际消耗的偏离值。"""
-        tc = float(self.data.get("turnCost") or 0.0)
-        self.data["syncedTurnCost"] = tc
-        self.data["deviation"] = float(self.data.get("todayUsage") or 0.0) - tc
+        """同步：算出“当前轮”（上次同步之后新增）的实际消耗与每轮预估的差值。
+
+        deviation = (todayUsage - syncedUsage) - (turnCost - syncedTurnCost)
+        —— 只反映最近一段同步间隔的差异（当前轮 / 这一批连轮），
+        不是当天累计差值；下一次同步重新起算，无轮次且余额未变时归零。
+        当天第一次同步（syncedUsage 为空）只立基准，不产生偏离。
+        """
+        led = self.data
+        today = float(led.get("todayUsage") or 0.0)
+        tc = float(led.get("turnCost") or 0.0)
+        prev = led.get("syncedUsage")
+        if prev is None:
+            led["deviation"] = 0.0
+        else:
+            prev_tc = float(led.get("syncedTurnCost") or 0.0)
+            led["deviation"] = (today - float(prev)) - (tc - prev_tc)
+        led["syncedUsage"] = today
+        led["syncedTurnCost"] = tc
 
     # ---- 按模型统计 ----
     def _local_model(self, name: str) -> dict:
@@ -522,7 +543,7 @@ class Ledger:
 
     @property
     def deviation(self) -> float:
-        """偏离值：最后一次同步时 实际消耗 - 每轮统计（可为负）。"""
+        """偏离值：最近一次同步间隔内 实际消耗 - 每轮预估（可为负）。"""
         return float(self.data.get("deviation") or 0.0)
 
     @property

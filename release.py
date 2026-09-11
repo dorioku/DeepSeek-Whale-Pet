@@ -36,7 +36,7 @@ NOTES_TEMPLATE = """**DeepSeek 小鲸鱼桌宠 · 独立桌面版** —— {tag}
 
 Windows 右下角的透明置顶小鲸鱼：直连 DeepSeek API 显示余额，并统计「今日已用」与「每轮对话消耗」。
 
-## 下载
+{extra}## 下载
 
 | 文件 | 说明 |
 | --- | --- |
@@ -58,6 +58,23 @@ SHA256  {sha}
 - 源码与更新日志：https://github.com/{repo}
 - 美术素材、峰谷定价规则与气泡视觉参数来自 [DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)（MIT License），详见仓库 README 的「致谢」。
 """
+
+# 各版本的「本次更新」（键 = 版本号，如 "0.3"）；没有就留空
+RELEASE_NOTES = {
+    "0.3": """## 本次更新
+
+- **全新界面风格**：右键菜单、托盘菜单与设置 / 账单 / 词典页统一成 Win11 风格 —— 圆角 + 半透明磨砂玻璃
+  （Win11 上走 DWM 亚克力模糊，老系统自动降级为半透明卡片）、菜单项图标、悬停高亮、强调色主按钮。
+- **台词词典编辑页**：不再直接丢进文本编辑器，改成和「设置」一样的编辑页面 ——
+  左边台词组、右边权重 / 类型 / 样式 / 换行 / 音效与每一条台词，支持新建 · 复制 · 删除 · 排序 · 恢复内置默认；
+  保存即生效（原子写入、不丢字段），页面里仍保留「用文本编辑器打开」给习惯改 JSON 的人。
+- **「气泡」二级菜单**：换一条台词 / 收起气泡 / 启用台词气泡。
+- **误差金额红绿显示**：气泡里「今日已用 ¥ x.xx (+0.12)」的括号按正负着绿 / 红，一眼看出偏差方向。
+- **修复**：长台词（如「真当我是便宜货啊...」）首尾被裁掉一截；菜单第二次弹出时毛玻璃失效；
+  标题栏图标发虚、标题字号字重偏大（改为 Win11 的 12px 常规字重）。
+
+""",
+}
 
 
 def say(msg: str = "") -> None:
@@ -163,7 +180,8 @@ def publish(tag: str, version: str, size_mb: int, sha: str, assume_yes: bool) ->
 
     say("=== [5/5] 创建 GitHub Release ===")
     notes = Path(tempfile.gettempdir()) / f"whalepet-{tag}-notes.md"
-    notes.write_text(NOTES_TEMPLATE.format(tag=tag, size=size_mb, sha=sha, repo=repo),
+    notes.write_text(NOTES_TEMPLATE.format(tag=tag, size=size_mb, sha=sha, repo=repo,
+                                           extra=RELEASE_NOTES.get(version, "")),
                      encoding="utf-8")
     result = run([gh, "release", "create", tag, str(EXE), "--title", tag,
                   "--notes-file", str(notes), "--verify-tag"])

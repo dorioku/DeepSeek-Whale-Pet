@@ -33,7 +33,7 @@ DEFAULTS = {
     "volume": 0.9,
     "bubble_on": True,
     "turn_cost_on": True,
-    "turn_cost_close_ms": 5000,  # 0=不自动关闭
+    "turn_cost_close_ms": 5000,  # 每轮消耗气泡自动收起毫秒数（0/负数 → 默认 5s，不做永久气泡）
     "peak_mode": "default",      # default / liangwen / qiangqiang
     "pos": {"h": "right", "v": "bottom", "hOff": 0, "vOff": 0, "x": None, "y": None},
     # 预警：余额低于阈值 / 今日已用超过阈值（0=关闭该项阈值判断）
@@ -81,6 +81,32 @@ def ledger_path() -> Path:
     if env:
         return Path(env)
     return config_path().parent / "ledger.json"
+
+
+def phrases_path() -> Path:
+    """台词词典路径：与 config.json 同目录（默认 `%APPDATA%\\WhalePet\\phrases.json`）。
+
+    词典是独立的、用户可编辑的 JSON：随机台词 / 峰谷文案都在里面，
+    首次运行自动生成一份默认词典（带 "_说明"），改完保存即生效。
+    可用 WHALE_PET_PHRASES_PATH 显式指定（多套词典 / 测试用）。
+    """
+    env = os.environ.get("WHALE_PET_PHRASES_PATH")
+    if env:
+        return Path(env)
+    return config_path().parent / "phrases.json"
+
+
+def sounds_dir() -> Path:
+    """用户自备音效目录：与 config.json 同目录的 `sounds/`（默认 `%APPDATA%\\WhalePet\\sounds\\`）。
+
+    词典里 `"sfx": "名字"` 的台词会**优先**在这里找 `名字.wav / .mp3`，其次才是
+    内置的 assets/ —— 想换成自己的音频（不想重新打包 / 不便改内置素材）丢这里即可。
+    可用 WHALE_PET_SOUNDS_PATH 显式指定（测试用）。
+    """
+    env = os.environ.get("WHALE_PET_SOUNDS_PATH")
+    if env:
+        return Path(env)
+    return config_path().parent / "sounds"
 
 
 def legacy_ledger_paths() -> list[Path]:

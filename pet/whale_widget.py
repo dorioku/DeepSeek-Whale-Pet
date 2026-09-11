@@ -8,12 +8,18 @@
 - 自适应轮询：基础 60s；既没中转调用、余额也没变化则每次 +100%（翻倍，上限 30 分钟）；
   有中转调用或余额与上次不一致就重置回 60s（点击可手动刷新）
 - 余额变化时数字滚动动画 + 弹气泡
-- 随机台词（加权 6 组，含 gif 动图），点击切换、5s 自动收起
-- 每轮对话消耗泡泡（来自中转服务的 usage 统计，跨线程 signal）
+- 随机台词来自**用户可自定义的词典**（phrases.json，加权分组 + gif 动图，见 pet/phrases.py），
+  5s 自动收起；词典文件改完保存即生效（自动重载），无需重启
+- 点击气泡（余额 / 计费 / 预警 / 启动气泡都一样）→ 换一条词典台词并把收起计时重置为 5s；
+  连续点击继续切换内容，不会把气泡点没；最近两次出现过的那条台词不会马上重复；
+  点击后 1s 内撞上的轮询 / 轮计费会排队延后执行（先让你把台词看完）；
+  没气泡时点击 = 弹余额气泡 + 手动刷新
+- 每轮对话消耗泡泡（来自中转服务的 usage 统计，跨线程 signal；快速连轮时
+  不再切换成新一轮的数值，而是直接累加轮数与金额，显示「连续 N 轮对话消耗」）
 - 每日账本：首次观测缓存当日资金初始值，每轮消耗立刻叠加，轮询同步后给 ±偏离值；
   按模型记录每日消耗并长期保留（账单对话框看最近 7 天 / 30 天）
 - 预警：余额低于阈值 / 今日已用超过阈值时弹气泡 + 托盘通知
-- 托盘 + 右键菜单（设置 / 账单 / 刷新 / 显示隐藏 / 退出）
+- 托盘 + 右键菜单（设置 / 账单 / 台词词典 / 刷新 / 显示隐藏 / 退出）
 """
 from __future__ import annotations
 
@@ -23,6 +29,7 @@ import os
 import random
 import re
 import time
+from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -31,10 +38,15 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QIcon, QMovie, QPainter, QPixmap,
 )
-from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon, QWidget
+from PySide6.QtWidgets import QApplication, QStyle, QSystemTrayIcon, QWidget
 
 from .balance import Ledger, fetch_balance, fetch_platform_usage, today_peak_now
-from .config import ledger_path, legacy_ledger_paths, load_config, save_config
+from .config import (ledger_path, legacy_ledger_paths, load_config, phrases_path,
+                     save_config, sounds_dir)
+from .phrases import BALANCE_ALERT_LINES, PhraseBook, content_key
+from .ui.menu import (WhaleMenu, glyph_icon, ICON_BUBBLE, ICON_CLOSE, ICON_DICT,
+                      ICON_HIDE, ICON_QUIT, ICON_REFRESH, ICON_SETTINGS, ICON_SHOW,
+                      ICON_STATS, ICON_SWAP)
 
 try:
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -61,13 +73,22 @@ TAIL_LEAD = 0.38              # 尾巴在全时间轴的前 38% 冒完（收起�
 BODY_LAG = 0.34               # 主体从 34% 开始展开（收起时先缩）
 POP_LOAD = 0.80               # 初始 / 收起末尾的气泡尺寸比例
 TEXT_RISE = 14.0              # 文字淡入上浮距离（viewBox 单位）
-COST_ROLL_MS = 320            # 连轮金额滚动时长
+TEXT_IN_DELAY_MS = 420        # 气泡登场后等形状展开完，文字才入场（否则字比气泡先到）
+TEXT_IN_MS = 230              # 文字入场时长（淡入 + 自下上浮）
+TEXT_OUT_MS = 170             # 文字离场时长（下沉淡出；走完才轮到气泡收起）
+COST_ROLL_MS = 416            # 消耗泡泡金额/token 滚动时长（原 320，慢放 30%）
 BUBBLE_COOLDOWN_MS = 550      # 气泡完全收起后的冷却：期间不再自动生成新气泡（防连续闪泡）
+AUTO_EFFECT_DELAY_MS = 1000   # 用户点击后这段时间内，轮询/轮计费的文本效果延后执行（先让台词停留）
+AUTO_EFFECT_QUEUE_MAX = 24    # 延后队列上限（防御：积压太多先把最旧的执行掉）
 
 # 音效节流（防连点叠音）：实测音效时长 104~264ms
 SOUND_MIN_GAP_MS = 90         # 两声之间最短间隔，更密的请求直接丢弃
 SOUND_CLICK_COOLDOWN_MS = 300 # 连点冷却：一次按下起算，期间的重复点击不出声
 SOUND_SWITCH_FADE_MS = 25     # 切换音效时旧声的淡出时长（交叉渡入，避免硬切爆音）
+
+# 台词音效（词典 "sfx" 字段）：同名文件按下面顺序查找；播放自带淡入，弱化突兀起音
+SOUND_SFX_EXTS = (".wav", ".mp3", ".aac", ".m4a", ".ogg", ".flac")
+SFX_FADE_IN_MS = 160          # 淡入时长（短音频会自动按比例缩短，不低于 70ms）
 
 COLOR_TEXT = QColor("#536ba9")
 COLOR_HINT = QColor("#9fb0d9")
@@ -104,6 +125,25 @@ _NO_LINE_START = ' \u3000，。、！？；：）】》」』〉·…—～%!?,.
 _NO_LINE_END = '（【《「『〈([{“‘«'
 # 断行单元：西文单词/数字整体不拆、连续点号整体不拆，其余逐字断行
 _UNIT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’\-+._:/]*|\.{2,}|[^A-Za-z0-9]")
+# 误差金额（“今日已用”末尾的 “(+0.12) / (-0.04)”）：行尾匹配，单独上色
+_DEV_RE = re.compile(r"\(\s*[+-]\s*\d+(?:\.\d+)?\s*\)\s*$")
+
+
+def _dev_segments(text: str, base: QColor):
+    """把行尾的误差金额拆出来单独上色：+ 用绿、- 用红（用户指定，2026-09-11 对调）。
+
+    返回 [(文本片段, 颜色)]（没有误差金额时就是整行一个片段、沿用原色）。
+    这样“今日已用 ¥ x.xx (+0.12)”里只有括号里的金额变色，一眼能看出差异方向。
+    """
+    m = _DEV_RE.search(text)
+    if not m:
+        return [(text, base)]
+    pen = COLOR_GREEN if "+" in m.group(0) else COLOR_RED
+    segs = []
+    if m.start() > 0:
+        segs.append((text[:m.start()], base))
+    segs.append((text[m.start():], pen))
+    return segs
 
 
 _FONT_DIRS = [
@@ -278,6 +318,11 @@ class WhaleWidget(QWidget):
         self.ledger = Ledger(ledger_path(), migrate_from=legacy_ledger_paths())
         self.today_usage = self.ledger.today_usage
         self.usage_dev = self.ledger.deviation
+        # 台词词典：用户可编辑的 JSON（与 config.json 同目录）；缺失时自动生成默认词典。
+        # 每次抽台词前按文件指纹检查改动，改完保存即生效（不用重启）。
+        self.phrases = PhraseBook(phrases_path(), create=True)
+        # 最近两次显示过的台词指纹：连续点击时不重复（同一个至少隔两次才会再出现）
+        self._recent_phrases = deque(maxlen=2)
         self.status = "loading"
         self.message = ""
         self.shown = None
@@ -317,6 +362,11 @@ class WhaleWidget(QWidget):
         self._token_shown = 0.0       # 正在显示的 token 数（同样平滑滚动）
         self.anim_token = Animator(self._set_token_shown, duration=COST_ROLL_MS,
                                    easing=QEasingCurve.OutCubic)
+        # 快速轮记账：同一段消耗气泡内再触发新一轮 → 轮数/金额/token 直接累加
+        # （不再把显示切换成“第二轮”的数值），气泡收起恢复余额内容后归零
+        self._turn_accum = 0          # 本段已累计的轮数（1 = 只显示上一轮）
+        self._cost_accum = 0.0        # 本段已累计的金额
+        self._token_accum = 0         # 本段已累计的 token
 
         # ----- 气泡/消耗 -----
         self.bubble_shown = False
@@ -350,6 +400,16 @@ class WhaleWidget(QWidget):
         self._restore_timer = QTimer(self)
         self._restore_timer.setSingleShot(True)
         self._restore_timer.timeout.connect(self._restore_after_hide)
+        # 离场时序：文字先离场（TEXT_OUT_MS），走完再让气泡收起（见 hide_bubble）
+        self._close_timer = QTimer(self)
+        self._close_timer.setSingleShot(True)
+        self._close_timer.timeout.connect(self._pop_close)
+        # 点击保护期：点击后 AUTO_EFFECT_DELAY_MS 内，轮询/轮计费的文本效果排队延后
+        self._click_until = -1e9      # 保护期截止（time.monotonic 口径）
+        self._auto_queue = []         # 待执行的自动文本效果（按触发顺序补跑）
+        self._auto_delay_timer = QTimer(self)
+        self._auto_delay_timer.setSingleShot(True)
+        self._auto_delay_timer.timeout.connect(self._flush_auto_effects)
 
         # ----- 音效 -----
         self._init_audio()
@@ -536,7 +596,10 @@ class WhaleWidget(QWidget):
             p.translate(-tx, -ty)
 
         if self._cost_lines:
-            labels = [("上一轮对话消耗:", COLOR_TEXT, 66, 600, False),
+            # 快速连轮时直接累加：标题显示本轮段已累计多少轮（单轮保持原版文案）
+            n_accum = int(getattr(self, "_turn_accum", 1) or 1)
+            title = "上一轮对话消耗:" if n_accum <= 1 else f"连续 {n_accum} 轮对话消耗:"
+            labels = [(title, COLOR_TEXT, 66, 600, False),
                       (self._fmt_amount(self._cost_shown, "CNY"), COLOR_RED, 128, 800, False)]
             tokens_line = self._fmt_tokens(self._token_shown)
             if tokens_line:
@@ -568,13 +631,22 @@ class WhaleWidget(QWidget):
                  - sum(r["h"] for r in rows) / 2.0)
             for r in rows:
                 p.setFont(r["font"])
-                p.setPen(r["color"])
                 multi = len(r["lines"]) > 1
+                fm = r["fm"]
                 for ln in r["lines"]:
                     lh = r["lh"] if multi else r["h"]
-                    # 以 tx 为中心水平居中（drawText(QPoint,…) 是左对齐）
-                    p.drawText(QRectF(tx - r["maxw"] / 2.0, y, r["maxw"], lh),
-                               int(Qt.AlignHCenter | Qt.AlignVCenter), ln)
+                    fw = float(fm.horizontalAdvance(ln))
+                    # 绘制框只作对齐用：按真实行宽/字高放大且不裁剪、以 tx 居中。
+                    # 否则“标点悬挂”导致的超宽行会被左右对称裁掉 —— 例如
+                    # “真当我是便宜货啊...” 的 “...” 悬出后，句首和句尾都会缺一截。
+                    ch = max(float(lh), float(fm.height()))
+                    x = tx - fw / 2.0
+                    for seg, pen in _dev_segments(ln, r["color"]):
+                        p.setPen(pen)
+                        gw = float(fm.horizontalAdvance(seg))
+                        p.drawText(QRectF(x, y + (lh - ch) / 2.0, gw + 1.0, ch),
+                                   int(Qt.AlignLeft | Qt.AlignVCenter | Qt.TextDontClip), seg)
+                        x += gw
                     y += lh
         p.restore()
 
@@ -803,8 +875,9 @@ class WhaleWidget(QWidget):
     def _fmt_deviation(self) -> str:
         """轮询同步后的偏离值：+0.12 / -0.04。
 
-        偏离值 = 余额算出的今日已用 - 本地每轮统计。没统计到任何一轮
-        （比如没走小鲸鱼中转）时不显示，避免把整天消耗都当成“偏离”。
+        偏离值 = 最近一次同步间隔内（余额/平台实测消耗 - 本地每轮预估），
+        只反映当前轮、不再全天累计（见 Ledger._sync_deviation）；
+        没统计到任何一轮（比如没走小鲸鱼中转）或差值 < 0.005 时不显示。
         """
         d = float(self.usage_dev or 0.0)
         if not math.isfinite(d) or abs(d) < 0.005:
@@ -921,9 +994,12 @@ class WhaleWidget(QWidget):
         self._check_balance_alert()
         if (changed and not currency_changed
                 and not (self.cost_bubble or self._alert_lines)):
-            self.show_bubble()
-            self._animate_amount(self._amount_value(), nb)
+            # 弹余额气泡 + 金额滚动属于“自动文本效果”：用户刚点过时延后到保护期结束
+            self._auto_effect(lambda: (self.show_bubble(),
+                                       self._animate_amount(self._amount_value(), nb)))
         else:
+            # 气泡在场时（计费/预警内容占位、或余额没变化）：轮询同样把停留时间重置到 5s
+            self._reset_bubble_hold()
             self.shown = nb
             self.update()
 
@@ -944,6 +1020,45 @@ class WhaleWidget(QWidget):
     def _bubble_exists(self) -> bool:
         """气泡是否“存在”：显示中，或还在弹出/收起的动画里（存在时只延长，不重播）。"""
         return self.bubble_shown or self.bubble_t > 0.01
+
+    def _reset_bubble_hold(self):
+        """气泡在场时，轮询 / 轮计费这类自动事件把停留时间重置（不重播动画、不改内容）。
+
+        - 计费内容按设置时长（0 回落 5s）、预警内容按自己的停留时长、其余普通气泡 5s；
+        - 气泡已收起（或正在收起）时不动它 —— 不打断收起过程、不让它重新冒出来；
+        - 与 `_click_to_random`（用户点击：换台词 + 重置 5s）配套：自动事件只延长，不换内容。
+        """
+        if not self.bubble_shown:
+            return
+        if self.cost_bubble:
+            self.cost_timer.start(self._cost_hold_ms())
+        elif self._alert_lines:
+            self.bubble_timer.start(int(getattr(self, "_alert_hold_ms", ALERT_BUBBLE_MS)))
+        else:
+            self.bubble_timer.start(BUBBLE_MS)
+
+    def _auto_effect(self, fn):
+        """执行一个“自动文本效果”（轮询 / 轮计费的气泡内容）。
+
+        用户刚点过（点击保护期 `AUTO_EFFECT_DELAY_MS` 内）时先排队，等保护期
+        结束再按触发顺序补执行 —— 让点击出来的台词先停留一下，不被立刻盖掉。
+        数据/账本早已在事件里更新过，这里只负责气泡上的展示效果。
+        """
+        left = self._click_until - time.monotonic()
+        if left <= 0:
+            fn()
+            return
+        self._auto_queue.append(fn)
+        if len(self._auto_queue) > AUTO_EFFECT_QUEUE_MAX:
+            self._auto_queue.pop(0)()        # 防御：积压太多，先把最旧的执行掉
+            return
+        self._auto_delay_timer.start(int(left * 1000) + 30)
+
+    def _flush_auto_effects(self):
+        """点击保护期结束：把这段时间攒下的自动效果按顺序补执行。"""
+        queue, self._auto_queue = self._auto_queue, []
+        for fn in queue:
+            fn()
 
     def show_bubble(self, force=False):
         if not self.bubble_on or self.cost_bubble:
@@ -968,11 +1083,12 @@ class WhaleWidget(QWidget):
         # 只有新气泡 / 收起中重开才重新安排文字出现（正在播的延迟不重置）
         self._pop_open()
         if not exists or not self._text_delay.isActive():
-            self._text_delay.start(420)   # 文字等气泡形状展开得差不多再出现
+            self._text_delay.start(TEXT_IN_DELAY_MS)   # 文字等气泡形状展开得差不多再出现
         self.bubble_timer.start(BUBBLE_MS)
 
     def _pop_open(self):
         """气泡出现：从头弹出（尾巴先冒 → 主体回弹展开），已显示则补到完全展开。"""
+        self._close_timer.stop()          # 取消“文字离场后才收起”的待执行收起
         if self.bubble_t < 0.05:
             self._pop_in = True
             self.anim_bubble.start(0.0, 1.0, BUBBLE_IN_MS, QEasingCurve.Linear)
@@ -997,6 +1113,10 @@ class WhaleWidget(QWidget):
         self._alert_lines = False
         self.bubble_random = False
         self.random_lines = None
+        # 消耗气泡这段会话结束：快速轮累计归零（下一轮从 1 起算）
+        self._turn_accum = 0
+        self._cost_accum = 0.0
+        self._token_accum = 0
         self._stop_gif()
 
     def _restore_after_hide(self):
@@ -1015,9 +1135,18 @@ class WhaleWidget(QWidget):
             # 文字已（快）透明：直接恢复余额内容不会闪
             self._restore_balance_lines()
         # 内容被切回余额、或文字还没显示完 → 淡入；已完整显示的余额内容不重播淡入
-        if (self.bubble_shown and not self.cost_bubble
-                and (had_other or self.text_t < 0.99)):
-            self.anim_text.start(0.0, 1.0, 230, QEasingCurve.OutCubic)
+        # （计费/预警气泡也走这里：气泡先登场，文字再入场）
+        if self.bubble_shown and (had_other or self.text_t < 0.99):
+            self.anim_text.start(0.0, 1.0, TEXT_IN_MS, QEasingCurve.OutCubic)
+
+    def _text_in_rest(self):
+        """文字入场接续：还没出现（或刚插入新内容）时补齐“气泡先登场”的剩余时间。"""
+        if self.text_t > 0.01:
+            # 已经在淡入：从当前透明度接着进
+            self.anim_text.start(self.text_t, 1.0, TEXT_IN_MS, QEasingCurve.OutCubic)
+        else:
+            delay = max(80, int(TEXT_IN_DELAY_MS * (1.0 - self.bubble_t)))
+            self._text_delay.start(delay)
 
     def hide_bubble(self):
         self.bubble_timer.stop()
@@ -1031,13 +1160,20 @@ class WhaleWidget(QWidget):
         # 保留当前台词（不清 random_lines）：让气泡带着原文字自然淡出。
         # 否则收起瞬间文字会先变回余额内容，看起来就是“收起到一半闪一下”。
         self._restore_lines = True
-        self._pop_close()
-        self.anim_text.start(self.text_t, 0.0, 170, QEasingCurve.InCubic)
-        # 淡出收尾后再恢复内容：此刻画面看不见，不会闪
-        self._restore_timer.start(BUBBLE_OUT_MS + 80)
+        # 离场时序：文字先走（下沉淡出），走完才轮到气泡收起——
+        # 否则两边各收各的，气泡都缩没了字还挂在那里。
+        text_out = self.text_t > 0.01
+        if text_out:
+            self.anim_text.start(self.text_t, 0.0, TEXT_OUT_MS, QEasingCurve.InCubic)
+            self._close_timer.start(TEXT_OUT_MS)
+        else:
+            self._pop_close()
+        # 离场总时长 = 文字 + 气泡；淡出收尾后再恢复内容：此刻画面看不见，不会闪
+        out_ms = (TEXT_OUT_MS if text_out else 0) + BUBBLE_OUT_MS
+        self._restore_timer.start(out_ms + 80)
         # 收起动画 + 冷却：这段时间内不再生成新气泡（短时间不会连续冒泡）
         self._bubble_cool_until = (time.monotonic()
-                                   + (BUBBLE_OUT_MS + BUBBLE_COOLDOWN_MS) / 1000.0)
+                                   + (out_ms + BUBBLE_COOLDOWN_MS) / 1000.0)
         self._stop_gif()
 
     def _set_bubble_t(self, v):
@@ -1064,43 +1200,19 @@ class WhaleWidget(QWidget):
         self.press_y = 1.0 - 0.12 * v
         self.update()
 
-    # ================= 随机台词 =================
+    # ================= 随机台词（用户词典） =================
     def _pick_random(self):
-        groups = [
-            (45, self._group_peak),
-            (7, lambda: [{"t": random.choice(["好模型... ↓", "好女孩...↓"]), "s": "B"}]),
-            (7, lambda: [{"t": random.choice([
-                "不知道用户有什么用，先赶走吧~", "我...我...我也要挣钱吗？",
-                "我去吃饭啦，测完叫我", "压力一只蓝色大肥鱼？！",
-                "DeepSleep...", "坏了...用户彻底怒了！"]), "s": "A", "w": True}]),
-            (10, lambda: {"gif": True}),
-            (3, lambda: [{"t": random.choice([
-                "你目录里的dsh是什么...大烧货吗...?",
-                "恭喜你实现token自由！token全跑了！",
-                "真当我是便宜货啊..."]), "s": "A", "w": True}]),
-            (1, lambda: [{"t": "哦鲸鲸... ", "s": "B"}]),
-        ]
-        total = sum(g[0] for g in groups)
-        r = random.random() * total
-        for weight, fn in groups:
-            r -= weight
-            if r < 0:
-                return fn()
-        return groups[-1][1]()
+        """抽一组台词：内容全部来自用户词典（pet/phrases.py，文件改完保存即生效）。
 
-    def _group_peak(self):
-        peak = today_peak_now()
-        off_text, peak_text = "空闲时段", "高峰时段"
-        if self.peak_mode == "liangwen":
-            off_text, peak_text = "梁文谷", "梁文峰"
-        elif self.peak_mode == "qiangqiang":
-            off_text, peak_text = "!?谷谷?!", "!?峰峰?!"
-        return [
-            {"t": "当前时间段为:", "s": "A"},
-            {"t": peak_text if peak else off_text, "s": "P",
-             "c": "#e0433f" if peak else "#2fa24c"},
-            {"t": self._today_text(), "s": "C"},
-        ]
+        连续点击不重复：最近两次出现过的那条不会再被抽到（词典可选内容不够时自动放宽）。
+        """
+        self.phrases.reload_if_changed()
+        lines = self.phrases.pick(today_text=self._today_text(),
+                                  peak=today_peak_now(),
+                                  peak_mode=self.peak_mode,
+                                  recent=list(self._recent_phrases))
+        self._recent_phrases.append(content_key(lines))
+        return lines
 
     # ================= gif =================
     def _load_gif(self):
@@ -1139,7 +1251,8 @@ class WhaleWidget(QWidget):
         except Exception:
             pass
         if self.turn_cost_on:
-            self.show_cost_bubble(cost, tokens)
+            # 计费气泡属于“自动文本效果”：用户刚点过台词时延后，先让台词停留
+            self._auto_effect(lambda: self.show_cost_bubble(cost, tokens))
         self._check_daily_alert()
 
     def _apply_cost_lines(self):
@@ -1149,6 +1262,10 @@ class WhaleWidget(QWidget):
         self.bubble_random = False
         self.random_lines = None
         self._stop_gif()
+
+    def _cost_hold_ms(self) -> int:
+        """消耗气泡的自动收起时长（ms）：按设置；0/负数回落默认 5s（不存在永久气泡）。"""
+        return int(self.turn_cost_close_ms) if self.turn_cost_close_ms > 0 else BUBBLE_MS
 
     def show_cost_bubble(self, amount, tokens=0, force=False):
         if not self.bubble_on or not self.turn_cost_on:
@@ -1169,44 +1286,58 @@ class WhaleWidget(QWidget):
             self._token_value = 0
         self.bubble_shown = True
         self._restore_lines = False      # 内容由消耗泡泡接管，无需再恢复
-        if self._cost_lines:
-            # 连轮触发：气泡已在显示计费内容 → 金额/token 从当前值滚到新值（不硬切），
-            # 气泡/文字只补到完全显示并延长停留，不重播任何生成动画。
-            self._swap_timer.stop()
-            self._swap_apply_fn = None
+        # 上一轮的计费内容还在淡出淡入途中（尚未画出来）时，紧随的这轮也算连轮
+        pending_cost = (not self._cost_lines
+                        and self._swap_apply_fn == self._apply_cost_lines)
+        if self._cost_lines or pending_cost:
+            # 快速连轮：不再切换成“第二轮”的数值，而是把本轮直接累加上去
+            # （轮数 +1，金额/token 滚到累计值）；气泡/文字只补到完全显示并
+            # 延长停留，不重播任何生成动画。
+            self._turn_accum += 1
+            self._cost_accum += self._cost_value
+            self._token_accum += self._token_value
+            self._cost_value = self._cost_accum
+            self._token_value = self._token_accum
             self._roll_cost()
             self._pop_open()
-            if self.text_t < 0.99:
-                self.anim_text.start(self.text_t if self.text_t > 0.01 else 0.0,
-                                     1.0, 200, QEasingCurve.OutCubic)
+            if self._cost_lines:
+                # 已画着计费内容：取消任何待切换，并让文字补到完全显示
+                self._swap_timer.stop()
+                self._swap_apply_fn = None
+                if self.text_t < 0.99:
+                    self._text_in_rest()
+            # pending_cost：保留待切换（否则内容切不过去），文字交给切换动画
         else:
+            # 新一段消耗会话：从这一轮起算
+            self._turn_accum = 1
+            self._cost_accum = self._cost_value
+            self._token_accum = self._token_value
             self._cost_shown = self._cost_value    # 首次显示消耗：直接显示目标值
             self._token_shown = float(self._token_value)
             self.anim_cost.stop()
             self.anim_token.stop()
             if not exists:
-                # 气泡不在：正常弹出
+                # 气泡不在：正常弹出；文字等气泡登场后再入场（同普通气泡）
                 self._apply_cost_lines()
                 self._pop_open()
-                self.anim_text.start(0.0, 1.0, 220, QEasingCurve.OutCubic)
+                self._text_delay.start(TEXT_IN_DELAY_MS)
             elif self.bubble_t < 0.999 or self.pop_t < 0.999:
                 # 与轮询气泡同时触发（气泡还在出场动画里）：直接改文本、把气泡补到
                 # 完全展开，不重播生成动画（否则看起来就是“又快速生成了一个气泡”）
                 self._apply_cost_lines()
                 self._pop_open()
                 if self.text_t < 0.99:
-                    self.anim_text.start(self.text_t if self.text_t > 0.01 else 0.0,
-                                         1.0, 200, QEasingCurve.OutCubic)
+                    self._text_in_rest()
             else:
                 # 稳定显示中：形状不动，内容先淡出再切（更柔和）
                 self._pop_open()
                 self._swap_bubble_content(self._apply_cost_lines)
-        if self.turn_cost_close_ms > 0:
-            self.cost_timer.start(int(self.turn_cost_close_ms))
+        # 自动收起：与普通气泡一致，不存在“永久气泡”（0/负数用默认 5s）
+        self.cost_timer.start(self._cost_hold_ms())
         self.update()
 
     def _roll_cost(self):
-        """连轮切换：金额与 token 都从正在显示的值平滑滚到新值（差得越多滚得越久）。"""
+        """快速连轮：金额与 token 都从正在显示的值平滑滚到累计值（差得越多滚得越久）。"""
         self._roll_shown(self.anim_cost, "_cost_shown", self._cost_value, 0.005, 0.05)
         self._roll_shown(self.anim_token, "_token_shown", float(self._token_value), 0.5, 50.0)
 
@@ -1256,10 +1387,11 @@ class WhaleWidget(QWidget):
         self._bal_alert_armed = False
         line = self._fmt_amount(b, self.currency)
         warn = "预警线 " + self._fmt_amount(self.alert_balance, self.currency)
+        # 气泡用大肥鱼专属台词（随机一条），余额数字照旧显示
         self.fire_alert(
             "余额预警",
             f"余额不足：{line}（{warn}）",
-            [{"t": "余额预警", "s": "A"},
+            [{"t": random.choice(BALANCE_ALERT_LINES), "s": "A", "w": True},
              {"t": line, "s": "P", "c": "#e0433f"},
              {"t": "低于" + warn, "s": "C"}],
         )
@@ -1301,7 +1433,7 @@ class WhaleWidget(QWidget):
             self.show_alert_bubble(lines)
 
     def show_alert_bubble(self, lines, hold_ms: int = ALERT_BUBBLE_MS):
-        """切到预警内容并停留一段时间（不受普通气泡 5s 收起限制；预警无视气泡冷却）。"""
+        """切到预警内容并停留一段时间（预警无视气泡冷却；被点击后转为普通台词泡，按 5s 收起）。"""
         self.cost_timer.stop()
         self.cost_bubble = False
         self.bubble_timer.stop()
@@ -1313,7 +1445,7 @@ class WhaleWidget(QWidget):
         if self.text_t <= 0.01:
             self._apply_alert_lines(lines)
             self._pop_open()
-            self.anim_text.start(0.0, 1.0, 230, QEasingCurve.OutCubic)
+            self._text_delay.start(TEXT_IN_DELAY_MS)   # 气泡先登场，文字再入场
         else:
             self._swap_bubble_content(lambda: self._apply_alert_lines(lines))
         self.bubble_timer.start(int(hold_ms))
@@ -1323,7 +1455,7 @@ class WhaleWidget(QWidget):
         """把气泡内容切到预警（可作为 _swap_bubble_content 的回调）。"""
         self._cost_lines = False
         self._alert_lines = True
-        self.bubble_random = True     # 复用台词绘制路径：点击即收起
+        self.bubble_random = True     # 复用台词绘制路径（被点击时会切成普通台词）
         self.random_lines = lines
         self._stop_gif()
 
@@ -1365,19 +1497,46 @@ class WhaleWidget(QWidget):
         ev.accept()
 
     def _on_click(self):
-        if self.cost_bubble:
-            self.hide_cost_bubble()
+        # 气泡（任何来源都一样：轮询余额 / 轮次计费 / 预警 / 启动首次气泡）：
+        # 点击 = 换一条词典台词 + 把收起计时重置为 5s；连点继续切换，不会把气泡点没。
+        if self._bubble_exists() or self.cost_bubble:
+            self._click_to_random()
             return
-        if not self.bubble_shown:
-            self.show_bubble(force=True)   # 用户主动点击：无视冷却
-            self.refresh_balance(True)
-            return
-        if self.bubble_random:
-            self.hide_bubble()
-            return
-        # 随机台词：先淡出，再应用内容，后淡入（更柔和）
-        r = self._pick_random()
-        self._swap_bubble_content(lambda: self._apply_random_lines(r))
+        # 没有气泡：点击弹出余额气泡并刷新（无视冷却）
+        self.show_bubble(force=True)
+        self.refresh_balance(True)
+
+    def _click_to_random(self):
+        """点击气泡：切成一条词典台词，并把自动收起计时重置为 5s（不会被点击关闭）。
+
+        - 计费 / 预警气泡被点击后按普通气泡计时（5s），不再按各自的停留时长；
+        - 收起动画中途点一下能把气泡吹回来（不重播生成动画）；
+        - 文字还没出现（气泡刚弹出 / 已淡出）→ 直接换内容、等形状展开再入场，
+          避免“淡出到一半又切”的闪动。
+        """
+        self.cost_timer.stop()
+        self.cost_bubble = False
+        self._restore_timer.stop()        # 取消“收起后恢复余额内容”的待办
+        self._restore_lines = False
+        self._bubble_cool_until = 0.0
+        self.bubble_shown = True
+        self._pop_open()                  # 收起动画中点一下：把气泡吹回来
+        # 点击保护期：期间的轮询/轮计费文本效果排队；已排队的顺延到这次点击之后
+        self._click_until = time.monotonic() + AUTO_EFFECT_DELAY_MS / 1000.0
+        if self._auto_queue:
+            self._auto_delay_timer.start(AUTO_EFFECT_DELAY_MS + 30)
+        lines = self._pick_random()
+        if self.text_t <= 0.01:
+            self._swap_timer.stop()       # 取消未生效的内容切换（否则会把台词盖回去）
+            self._swap_apply_fn = None
+            self._apply_random_lines(lines)
+            self._text_in_rest()
+            self.bubble_timer.start(BUBBLE_MS)
+        else:
+            self._text_delay.stop()       # 别让旧内容的延迟淡入插进来
+            self._swap_bubble_content(lambda: self._apply_random_lines(lines))
+            self.bubble_timer.stop()      # 切换动画走完由 _swap_apply 按 5s 重新计时
+        self.update()
 
     def _apply_random_lines(self, lines):
         """把气泡内容切到随机台词（可作为 _swap_bubble_content 的回调）。"""
@@ -1390,6 +1549,15 @@ class WhaleWidget(QWidget):
                 self.movie.start()
         else:
             self._stop_gif()
+            self._play_lines_sfx(lines)
+
+    def _play_lines_sfx(self, lines):
+        """台词自带的音效（词典 "sfx" 字段）：一次内容最多放一个。"""
+        for ln in lines or []:
+            name = ln.get("sfx") if isinstance(ln, dict) else None
+            if name:
+                self._play_sfx(name)
+                return
 
     def _swap_bubble_content(self, apply):
         """内容切换淡出淡入：fade out 150ms → 应用 → fade in 220ms。"""
@@ -1403,10 +1571,9 @@ class WhaleWidget(QWidget):
         if apply is None:
             return
         apply()
-        # 重置自动关闭计时：消耗泡泡按设置，预警按自己的停留时长，普通气泡 5s
+        # 重置自动关闭计时：消耗泡泡按设置（<=0 回落默认 5s），预警按自己的停留时长，普通气泡 5s
         if self.cost_bubble:
-            if self.turn_cost_close_ms > 0:
-                self.cost_timer.start(int(self.turn_cost_close_ms))
+            self.cost_timer.start(self._cost_hold_ms())
         elif self._alert_lines:
             self.bubble_timer.start(int(getattr(self, "_alert_hold_ms", ALERT_BUBBLE_MS)))
         else:
@@ -1460,6 +1627,7 @@ class WhaleWidget(QWidget):
         self._sfx_until = -1e9     # 连点冷却截止时刻
         self._sfx_muted = False    # 本次点击是否已被冷却吞掉（回弹音一并吞掉）
         self._players = {}
+        self._sfx_src = {}         # ("sfx", name) → 已解析的音频路径（换文件后换源）
         if not _HAS_AUDIO:
             return
         try:
@@ -1478,6 +1646,109 @@ class WhaleWidget(QWidget):
                     self._players[(name, kind)] = (player, out)
         except Exception:
             self._players = {}
+
+    def _sfx_source(self, name):
+        """解析台词音效路径：先用户目录 sounds/（可自备），再内置 assets/。
+
+        同一目录里同名文件按 SOUND_SFX_EXTS 顺序取第一个（wav → mp3 → aac → …）。
+        """
+        for folder in (sounds_dir(), ASSETS):
+            for ext in SOUND_SFX_EXTS:
+                cand = folder / (name + ext)
+                if cand.exists():
+                    return cand
+        return None
+
+    def _sfx_player(self, name):
+        """取台词音效播放器：**每次播放前重新解析**文件（运行中丢/换文件即时生效）。
+
+        播放器按名字缓存在 `_players`；解析路径变了就换源（文件删了则静默不播）。
+        """
+        if not _HAS_AUDIO:
+            return None
+        src = self._sfx_source(name)
+        if src is None:
+            return None                     # 没放音频文件 → 静默，不影响台词
+        key = ("sfx", name)
+        entry = self._players.get(key)
+        if entry and self._sfx_src.get(key) == src:
+            return entry
+        try:
+            if entry:                       # 换源：复用播放器（连接/音量还在）
+                player, out = entry
+                player.stop()
+                player.setSource(QUrl.fromLocalFile(str(src)))
+            else:
+                player = QMediaPlayer()
+                out = QAudioOutput()
+                player.setAudioOutput(out)
+                out.setVolume(self.volume)
+                player.setSource(QUrl.fromLocalFile(str(src)))
+                player.positionChanged.connect(
+                    lambda pos, p=player, o=out: self._maybe_fade_out(p, o, pos))
+                player.mediaStatusChanged.connect(
+                    lambda st, p=player, k=key: self._sfx_status(p, k, st))
+                self._players[key] = (player, out)
+            self._sfx_src[key] = src
+        except Exception:
+            return None
+        return self._players[key]
+
+    def _play_sfx(self, name):
+        """播放台词音效（沿用单声道规则：发新声前把在响的旧声快速淡出）。"""
+        if self.volume <= 0:
+            return
+        entry = self._sfx_player(name)
+        if not entry:
+            return
+        player, out = entry
+        try:
+            for k, (other, other_out) in self._players.items():
+                if other is player or other.playbackState() != QMediaPlayer.PlayingState:
+                    continue
+                self._tween_volume(other_out, float(other_out.volume()), 0.0,
+                                   SOUND_SWITCH_FADE_MS)
+                QTimer.singleShot(SOUND_SWITCH_FADE_MS,
+                                  lambda p=other, kk=k: self._stop_and_release(p, kk))
+            player.stop()
+            self._fade_done.discard(id(player))
+            self._sfx_at = time.monotonic() * 1000.0    # 与点击声互不叠放
+            out.setVolume(0.0)
+            player.play()
+            # 淡入：短音频按比例缩短，别把人声起音吃掉
+            dur = player.duration()
+            fade = SFX_FADE_IN_MS if dur <= 0 else min(SFX_FADE_IN_MS,
+                                                       max(70, int(dur * 0.35)))
+            self._tween_volume(out, 0.0, self.volume, fade)
+        except Exception:
+            pass
+
+    def _sfx_status(self, player, key, status):
+        """台词音效播完（或文件读不出来）后释放源文件句柄。
+
+        Windows 上 QMediaPlayer 会一直把音频文件开着：不释放的话，用户
+        在程序运行时就没办法替换/删除 sounds/ 里的音频（WinError 32）。
+        """
+        if status in (QMediaPlayer.MediaStatus.EndOfMedia,
+                      QMediaPlayer.MediaStatus.InvalidMedia):
+            self._release_sfx(player, key)
+
+    def _release_sfx(self, player, key):
+        """清空音效源（松开文件），下次播放会重新解析路径。"""
+        try:
+            player.setSource(QUrl())
+        except Exception:
+            pass
+        self._sfx_src.pop(key, None)
+
+    def _stop_and_release(self, player, key):
+        """淡出结束后停声；台词音效顺手松文件（点击音效只停）。"""
+        try:
+            player.stop()
+        except Exception:
+            return
+        if key[0] == "sfx":
+            self._release_sfx(player, key)
 
     def _maybe_fade_out(self, player, out, pos):
         dur = player.duration()
@@ -1540,12 +1811,13 @@ class WhaleWidget(QWidget):
         player, out = entry
         try:
             # 单声道：仍在响的旧声淡出并停掉，不让两声叠在一起
-            for other, other_out in self._players.values():
+            for k, (other, other_out) in self._players.items():
                 if other is player or other.playbackState() != QMediaPlayer.PlayingState:
                     continue
                 self._tween_volume(other_out, float(other_out.volume()), 0.0,
                                    SOUND_SWITCH_FADE_MS)
-                QTimer.singleShot(SOUND_SWITCH_FADE_MS, other.stop)
+                QTimer.singleShot(SOUND_SWITCH_FADE_MS,
+                                  lambda p=other, kk=k: self._stop_and_release(p, kk))
             player.stop()
             self._fade_done.discard(id(player))
             self._sfx_at = now
@@ -1557,24 +1829,80 @@ class WhaleWidget(QWidget):
             pass
 
     # ================= 菜单 / 托盘 =================
-    def contextMenuEvent(self, ev):
-        menu = QMenu(self)
-        act_settings = menu.addAction("设置…")
-        act_stats = menu.addAction("账单…")
-        act_refresh = menu.addAction("刷新余额")
-        act_toggle = menu.addAction("隐藏" if self.isVisible() else "显示")
+    def _fill_menu(self, menu) -> dict:
+        """右键 / 托盘菜单的共同内容（W11 风格 WhaleMenu：微倒角 + 微毛玻璃）。
+
+        「气泡」是二级菜单，用同一个类构建 → 样式自动同款（见 `pet/ui/menu.py`）。
+        返回各动作供接线；菜单里会变的项由 `_sync_menu_state` 统一刷新。
+        """
+        acts = {}
+        acts["settings"] = menu.addAction(glyph_icon(ICON_SETTINGS), "设置…")
+        acts["stats"] = menu.addAction(glyph_icon(ICON_STATS), "账单…")
+        acts["phrases"] = menu.addAction(glyph_icon(ICON_DICT), "台词词典…")
+        acts["refresh"] = menu.addAction(glyph_icon(ICON_REFRESH), "刷新余额")
+        sub = menu.addMenu(glyph_icon(ICON_BUBBLE), "气泡")
+        acts["swap"] = sub.addAction(glyph_icon(ICON_SWAP), "换一条台词")
+        acts["close"] = sub.addAction(glyph_icon(ICON_CLOSE), "收起气泡")
+        acts["bubble_on"] = sub.addAction("启用台词气泡")
+        acts["bubble_on"].setCheckable(True)
         menu.addSeparator()
-        act_quit = menu.addAction("退出")
+        acts["toggle"] = menu.addAction("显示/隐藏小鲸鱼")
+        menu.addSeparator()
+        acts["quit"] = menu.addAction(glyph_icon(ICON_QUIT), "退出")
+        acts["sub"] = sub
+        self._sync_menu_state(acts)
+        return acts
+
+    def _sync_menu_state(self, acts):
+        """刷新菜单里会变的项：显示/隐藏文案与图标、台词气泡勾选、子项可用性。"""
+        visible = self.isVisible()
+        acts["toggle"].setIcon(glyph_icon(ICON_HIDE if visible else ICON_SHOW))
+        acts["toggle"].setText("隐藏小鲸鱼" if visible else "显示小鲸鱼")
+        box = acts["bubble_on"]
+        if box.isChecked() != bool(self.bubble_on):
+            box.blockSignals(True)        # 程序同步状态时别触发 toggled
+            box.setChecked(bool(self.bubble_on))
+            box.blockSignals(False)
+        acts["swap"].setEnabled(bool(self.bubble_on))
+        acts["close"].setEnabled(bool(self._bubble_exists() or self.cost_bubble))
+
+    def _set_bubble_on(self, on: bool):
+        """菜单「启用台词气泡」：立刻生效 + 写回配置（等同设置里的开关）。"""
+        self.bubble_on = bool(on)
+        self.cfg["bubble_on"] = bool(on)
+        try:
+            save_config(self.cfg)
+        except Exception:
+            pass
+        if not on:
+            self._close_bubble_from_menu()
+
+    def _close_bubble_from_menu(self):
+        """菜单「收起气泡」：本来就没气泡时不触发收起动画/冷却。"""
+        if self._bubble_exists() or self.cost_bubble:
+            self.hide_bubble()
+
+    def contextMenuEvent(self, ev):
+        menu = WhaleMenu(self)
+        acts = self._fill_menu(menu)
         act = menu.exec(ev.globalPos())
-        if act == act_settings:
+        if act == acts["settings"]:
             self.open_settings()
-        elif act == act_stats:
+        elif act == acts["stats"]:
             self.open_stats()
-        elif act == act_refresh:
+        elif act == acts["phrases"]:
+            self.open_phrases()
+        elif act == acts["refresh"]:
             self.refresh_balance(True)
-        elif act == act_toggle:
+        elif act == acts["swap"]:
+            self._click_to_random()
+        elif act == acts["close"]:
+            self._close_bubble_from_menu()
+        elif act == acts["bubble_on"]:
+            self._set_bubble_on(acts["bubble_on"].isChecked())
+        elif act == acts["toggle"]:
             self.setVisible(not self.isVisible())
-        elif act == act_quit:
+        elif act == acts["quit"]:
             QApplication.quit()
 
     def setup_tray(self):
@@ -1582,18 +1910,19 @@ class WhaleWidget(QWidget):
             QApplication.style().standardIcon(QStyle.SP_ComputerIcon)
         self.tray = QSystemTrayIcon(icon, self)
         self.tray.setToolTip("DeepSeek 小鲸鱼")
-        menu = QMenu()
-        act_settings = menu.addAction("设置…")
-        act_stats = menu.addAction("账单…")
-        act_refresh = menu.addAction("刷新余额")
-        act_show = menu.addAction("显示/隐藏")
-        menu.addSeparator()
-        act_quit = menu.addAction("退出")
-        act_settings.triggered.connect(self.open_settings)
-        act_stats.triggered.connect(self.open_stats)
-        act_refresh.triggered.connect(lambda: self.refresh_balance(True))
-        act_show.triggered.connect(lambda: self.setVisible(not self.isVisible()))
-        act_quit.triggered.connect(QApplication.quit)
+        menu = WhaleMenu()
+        acts = self._fill_menu(menu)
+        acts["settings"].triggered.connect(self.open_settings)
+        acts["stats"].triggered.connect(self.open_stats)
+        acts["phrases"].triggered.connect(self.open_phrases)
+        acts["refresh"].triggered.connect(lambda: self.refresh_balance(True))
+        acts["swap"].triggered.connect(self._click_to_random)
+        acts["close"].triggered.connect(self._close_bubble_from_menu)
+        acts["bubble_on"].toggled.connect(self._set_bubble_on)
+        acts["toggle"].triggered.connect(lambda: self.setVisible(not self.isVisible()))
+        acts["quit"].triggered.connect(QApplication.quit)
+        # 托盘菜单长期存在：每次弹出前刷新会变的项（文案/图标/勾选/可用性）
+        menu.aboutToShow.connect(lambda: self._sync_menu_state(acts))
         self.tray.setContextMenu(menu)
         self.tray.show()
         self._tray_menu = menu
@@ -1612,6 +1941,11 @@ class WhaleWidget(QWidget):
         dlg = StatsDialog(self, self.ledger)
         dlg.exec()
         return dlg
+
+    def open_phrases(self):
+        """打开台词词典编辑页（保存后自动重载，无需重启）。"""
+        from .ui.phrases_dialog import PhrasesDialog
+        PhrasesDialog(self, self.phrases.path).exec()
 
     def _apply_cfg(self):
         self.scale = float(self.cfg.get("scale", 1.5))
